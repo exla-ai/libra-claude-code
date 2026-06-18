@@ -1,0 +1,11 @@
+{
+  "name": "libra",
+  "owner": { "name": "exla", "url": "https://libra.exla.ai" },
+  "plugins": [
+    {
+      "name": "libra-claude-code",
+      "source": "./",
+      "description": "Libra in Claude Code: commit-time risk checks grounded in YOUR production history (real CloudWatch signals, deploy history, past incidents), plus /libra to ask Libra anything about your services. Advisory, fail-open, no raw secrets leave your machine."
+    }
+  ]
+}
