@@ -1,5 +1,6 @@
 {
   "name": "libra",
+  "description": "Libra for Claude Code, including hooks, commands, skills, and MCP setup for production-grounded commit checks.",
   "owner": { "name": "exla", "url": "https://libra.exla.ai" },
   "plugins": [
     {
