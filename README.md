@@ -3,7 +3,7 @@
 Libra is your production ops agent (it watches your AWS + GitHub). This plugin brings
 it into Claude Code so it can:
 
-- **Capture sanitized session events** so Libra knows what you and Claude Code were trying to change, without storing raw transcripts by default.
+- **Capture sanitized coding-agent session events** so Libra knows what you and Claude Code or Codex were trying to change, without storing raw transcripts by default.
 - **Check your commits** against your *own* production history before they land, real
   CloudWatch signals, deploy history, and past incidents, not generic linting.
 - **Answer questions** about your live services with `/libra` (what's failing in prod,
@@ -32,7 +32,8 @@ This is the normal install path. It installs:
 - the remote MCP server at `https://api.libra.exla.ai/mcp`.
 
 `/libra-login` stores the API key locally and adds or updates the MCP server with
-the same key. After this, Claude Code can call `libra_query`,
+the same key. It also installs Libra hooks into `~/.codex/hooks.json` so native
+Codex sessions send the same sanitized event stream. After this, Claude Code can call `libra_query`,
 `libra_check_commit`, `libra_list_fix_offers`, `libra_view_session_events`, and
 `libra_accept_fix_offer`, and
 the local hook process can run commit checks when Claude Code attempts
@@ -41,8 +42,10 @@ the local hook process can run commit checks when Claude Code attempts
 After login, the Libra dashboard shows received sessions at
 `https://libra.exla.ai/dashboard/claude`. A full plugin install records a
 sanitized event on every Claude Code `SessionStart`, user prompt, tool use,
-compaction, and session end. If only MCP is installed, Claude Code can call Libra
-tools, but no automatic session events are sent.
+compaction, and session end. It also records native Codex `SessionStart`,
+`UserPromptSubmit`, and `Stop` events once `/libra-login` installs the Codex
+hooks. If only MCP is installed, the coding agent can call Libra tools, but no
+automatic session events are sent.
 
 ## Tool-only fallback: remote MCP
 
@@ -63,7 +66,8 @@ Only what Libra needs to reason, never raw secrets or full file contents:
 - the staged file names and a diffstat summary,
 - the repo, branch, and HEAD,
 - sanitized hook metadata, user-prompt summaries, tool names, and command summaries,
-- optionally, bounded sanitized transcript summaries or entries only if `captureTranscript` is enabled.
+- bounded sanitized transcript summaries when the agent hook exposes a transcript path,
+- bounded sanitized transcript entries only if full transcript capture is explicitly enabled.
 
 Tokens, env values, keys, and auth headers are redacted before anything leaves your
 machine. Hard caps bound payload size.
@@ -77,19 +81,20 @@ Zero config is the default. Drop this in your repo only to override:
   "enabled": true,
   "ignorePaths": ["**/*.snap", "fixtures/**"],
   "maxDiffBytes": 200000,
-  "captureTranscript": false
+  "captureTranscript": "summary"
 }
 ```
 
-Default behavior does not read the transcript file. Set `"captureTranscript": "summary"`
-to send sanitized transcript-line summaries, or `true` to send bounded sanitized entries.
-Libra's dashboard should show derived intents, risks, commit checks, and fix offers, not
-raw Claude Code transcripts.
+Default behavior sends sanitized transcript-line summaries when the agent hook
+provides a transcript path. Set `"captureTranscript": false` to disable transcript
+tailing entirely, or `true` / `"full"` to send bounded sanitized entries. Libra's
+dashboard should show derived intents, risks, commit checks, fix offers, and
+sanitized session context, not raw Claude Code or Codex transcripts.
 
 For debugging, Libra can show the sanitized event stream it received for a Claude
-Code session through `libra_view_session_events` or
+Code or Codex session through `libra_view_session_events` or
 `GET /developer-sessions/:id/events`. This is still not a raw transcript viewer
-unless transcript capture was explicitly enabled client-side, and even then
+unless full transcript capture was explicitly enabled client-side, and even then
 payloads are redacted and capped before storage.
 
 ## How it behaves at commit time
@@ -107,6 +112,7 @@ Implemented in this package:
 - Hosted remote MCP endpoint at `https://api.libra.exla.ai/mcp` for on-demand tools.
 - Claude Code hooks for session start, user prompts, tool use, compaction, session end,
   and commit attempts.
+- Codex hook installer for native Codex session start, user prompt, and stop events.
 - Local redaction, transcript tailing by offset, bounded event batches, and fail-open API
   calls.
 - Advisory commit checks, sanitized session-event viewing, fix-offer listing, and

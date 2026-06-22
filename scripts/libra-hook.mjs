@@ -9,6 +9,7 @@ const DEFAULT_API = "https://api.libra.exla.ai";
 const MAX_TRANSCRIPT_BYTES_PER_HOOK = 80_000;
 const MAX_EVENTS_PER_POST = 40;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
+const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 
 main().catch(() => process.exit(0));
 
@@ -23,24 +24,31 @@ async function main() {
   const credentials = readCredentials();
   if (!credentials.token) return;
 
+  const agent = normalizeAgentName(process.argv[2] || input.agent || input.client || detectAgentFromEnv());
   const repoInfo = resolveRepo(cwd);
 
   const sessionExternalId = String(
     input.session_id ||
     input.sessionId ||
     input.conversation_id ||
+    input.conversationId ||
+    input.thread_id ||
+    input.threadId ||
     process.env.CLAUDE_CODE_SESSION_ID ||
+    process.env.CODEX_SESSION_ID ||
+    process.env.CODEX_COMPANION_SESSION_ID ||
     hash(`${cwd}:${input.transcript_path || Date.now()}`),
   );
+  const transcriptPath = findTranscriptPath(input, agent, sessionExternalId);
   const hookEvent = String(input.hook_event_name || input.hookEventName || input.event || "event");
   const branch = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
   const head = git(["rev-parse", "HEAD"], cwd);
-  const events = buildEvents(input, hookEvent, config);
+  const events = buildEvents(input, hookEvent, config, agent);
 
-  if (input.transcript_path && config.captureTranscript === true) {
-    events.push(...tailTranscriptEvents(input.transcript_path, sessionExternalId, config));
-  } else if (input.transcript_path && config.captureTranscript === "summary") {
-    events.push(...tailTranscriptSummaries(input.transcript_path, sessionExternalId, config));
+  if (transcriptPath && config.captureTranscript === true) {
+    events.push(...tailTranscriptEvents(transcriptPath, sessionExternalId, config, agent));
+  } else if (transcriptPath && config.captureTranscript === "summary") {
+    events.push(...tailTranscriptSummaries(transcriptPath, sessionExternalId, config, agent));
   }
 
   if (events.length) {
@@ -49,12 +57,14 @@ async function main() {
       repo: repoInfo.repo,
       branch,
       head,
-      client: "claude-code",
+      client: agent,
       cwd,
       metadata: {
+        agent,
         hookEvent,
         pluginVersion: "0.1.0",
-        captureTranscript: config.captureTranscript || false,
+        captureTranscript: config.captureTranscript,
+        transcriptPathDetected: Boolean(transcriptPath),
         repoSource: repoInfo.source,
         repoDetected: repoInfo.source !== "local",
       },
@@ -100,33 +110,109 @@ function readConfig(cwd) {
     ignorePaths: ["**/*.snap", "fixtures/**"],
     maxDiffBytes: 200_000,
     maxTranscriptBytesPerHook: MAX_TRANSCRIPT_BYTES_PER_HOOK,
-    captureTranscript: false,
+    captureTranscript: DEFAULT_TRANSCRIPT_CAPTURE,
   };
   try {
     const raw = fs.readFileSync(path.join(cwd, ".libra/claude-code.json"), "utf8");
-    return { ...defaults, ...JSON.parse(raw) };
+    return normalizeConfig({ ...defaults, ...JSON.parse(raw) });
   } catch {
     return defaults;
   }
 }
 
-function buildEvents(input, hookEvent, config) {
+function normalizeConfig(config) {
+  const captureTranscript = config.captureTranscript === true
+    ? true
+    : config.captureTranscript === false
+      ? false
+      : config.captureTranscript === "full"
+        ? true
+        : "summary";
+  return { ...config, captureTranscript };
+}
+
+function buildEvents(input, hookEvent, config, agent) {
   const now = new Date().toISOString();
   const base = {
     type: normalizeEventType(hookEvent),
     occurredAt: now,
     sequence: Date.now(),
     payload: sanitizeValue({
+      agent,
       hook_event_name: hookEvent,
       tool_name: input.tool_name || input.tool,
-      tool_input: sanitizeToolInput(input.tool_input, config),
-      prompt: input.prompt || input.user_prompt,
+      tool_input: sanitizeToolInput(input.tool_input || input.toolInput, config),
+      prompt: input.prompt || input.user_prompt || input.userPrompt || input.message,
       compact_summary: input.summary,
       result: input.tool_response || input.tool_result,
     }),
   };
   base.summary = summarizeHookEvent(base.payload, hookEvent);
   return [base];
+}
+
+function normalizeAgentName(value) {
+  const raw = String(value || "").toLowerCase();
+  if (raw.includes("codex")) return "codex";
+  if (raw.includes("claude")) return "claude-code";
+  return "claude-code";
+}
+
+function detectAgentFromEnv() {
+  if (process.env.CODEX_SESSION_ID || process.env.CODEX_COMPANION_SESSION_ID || process.env.CODEX_HOME) return "codex";
+  return "claude-code";
+}
+
+function findTranscriptPath(input, agent, sessionExternalId) {
+  const candidates = [
+    input.transcript_path,
+    input.transcriptPath,
+    input.codex_transcript_path,
+    input.codexTranscriptPath,
+    input.session_path,
+    input.sessionPath,
+    input.conversation_path,
+    input.conversationPath,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const value = String(candidate);
+    try {
+      if (fs.existsSync(value) && fs.statSync(value).isFile()) return value;
+    } catch {}
+  }
+  if (agent === "codex") return findCodexSessionFile(sessionExternalId);
+  return null;
+}
+
+function findCodexSessionFile(sessionExternalId) {
+  const id = String(sessionExternalId || "");
+  if (id.length < 8) return null;
+  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+  const sessionsDir = path.join(codexHome, "sessions");
+  let match = null;
+
+  function walk(dir, depth) {
+    if (match || depth > 6) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (match) return;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full, depth + 1);
+      } else if (entry.isFile() && entry.name.endsWith(".jsonl") && entry.name.includes(id)) {
+        match = full;
+      }
+    }
+  }
+
+  walk(sessionsDir, 0);
+  return match;
 }
 
 function normalizeEventType(name) {
@@ -177,7 +263,7 @@ function sanitizeToolInput(toolInput, config) {
   return sanitizeValue(out);
 }
 
-function tailTranscriptSummaries(transcriptPath, sessionExternalId, config) {
+function tailTranscriptSummaries(transcriptPath, sessionExternalId, config, agent) {
   const lines = tailNewTranscriptLines(transcriptPath, sessionExternalId, config);
   return lines.map((line, index) => {
     const parsed = safeJson(line);
@@ -187,6 +273,7 @@ function tailTranscriptSummaries(transcriptPath, sessionExternalId, config) {
       sequence: Date.now() + index + 1,
       summary: summarizeTranscriptLine(parsed || line),
       payload: sanitizeValue({
+        agent,
         kind: parsed?.type || parsed?.role || "transcript_line",
         summary: summarizeTranscriptLine(parsed || line),
       }),
@@ -194,7 +281,7 @@ function tailTranscriptSummaries(transcriptPath, sessionExternalId, config) {
   });
 }
 
-function tailTranscriptEvents(transcriptPath, sessionExternalId, config) {
+function tailTranscriptEvents(transcriptPath, sessionExternalId, config, agent) {
   const lines = tailNewTranscriptLines(transcriptPath, sessionExternalId, config);
   return lines.map((line, index) => {
     const parsed = safeJson(line);
@@ -203,7 +290,7 @@ function tailTranscriptEvents(transcriptPath, sessionExternalId, config) {
       occurredAt: new Date().toISOString(),
       sequence: Date.now() + index + 1,
       summary: summarizeTranscriptLine(parsed || line),
-      payload: sanitizeValue(parsed || { line }),
+      payload: sanitizeValue({ agent, entry: parsed || { line } }),
     };
   });
 }
@@ -347,7 +434,7 @@ function git(args, cwd) {
 }
 
 function statePath(sessionExternalId) {
-  return path.join(os.homedir(), ".config/libra/claude-code", `${hash(sessionExternalId)}.json`);
+  return path.join(os.homedir(), ".config/libra/coding-agent", `${hash(sessionExternalId)}.json`);
 }
 
 function readState(sessionExternalId) {
