@@ -33,9 +33,16 @@ This is the normal install path. It installs:
 
 `/libra-login` stores the API key locally and adds or updates the MCP server with
 the same key. After this, Claude Code can call `libra_query`,
-`libra_check_commit`, `libra_list_fix_offers`, and `libra_accept_fix_offer`, and
+`libra_check_commit`, `libra_list_fix_offers`, `libra_view_session_events`, and
+`libra_accept_fix_offer`, and
 the local hook process can run commit checks when Claude Code attempts
 `git commit`.
+
+After login, the Libra dashboard shows received sessions at
+`https://libra.exla.ai/dashboard/claude`. A full plugin install records a
+sanitized event on every Claude Code `SessionStart`, user prompt, tool use,
+compaction, and session end. If only MCP is installed, Claude Code can call Libra
+tools, but no automatic session events are sent.
 
 ## Tool-only fallback: remote MCP
 
@@ -79,6 +86,12 @@ to send sanitized transcript-line summaries, or `true` to send bounded sanitized
 Libra's dashboard should show derived intents, risks, commit checks, and fix offers, not
 raw Claude Code transcripts.
 
+For debugging, Libra can show the sanitized event stream it received for a Claude
+Code session through `libra_view_session_events` or
+`GET /developer-sessions/:id/events`. This is still not a raw transcript viewer
+unless transcript capture was explicitly enabled client-side, and even then
+payloads are redacted and capped before storage.
+
 ## How it behaves at commit time
 
 | Libra finding | What happens |
@@ -96,7 +109,8 @@ Implemented in this package:
   and commit attempts.
 - Local redaction, transcript tailing by offset, bounded event batches, and fail-open API
   calls.
-- Advisory commit checks, fix-offer listing, and `/libra` query fallback.
+- Advisory commit checks, sanitized session-event viewing, fix-offer listing, and
+  `/libra` query fallback.
 
 Still planned:
 - First-class distribution docs and a published install URL.

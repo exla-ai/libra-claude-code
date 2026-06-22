@@ -23,10 +23,15 @@ async function main() {
   const credentials = readCredentials();
   if (!credentials.token) return;
 
-  const repo = git(["remote", "get-url", "origin"], cwd);
-  if (!repo) return;
+  const repoInfo = resolveRepo(cwd);
 
-  const sessionExternalId = String(input.session_id || input.sessionId || input.conversation_id || hash(`${cwd}:${input.transcript_path || ""}`));
+  const sessionExternalId = String(
+    input.session_id ||
+    input.sessionId ||
+    input.conversation_id ||
+    process.env.CLAUDE_CODE_SESSION_ID ||
+    hash(`${cwd}:${input.transcript_path || Date.now()}`),
+  );
   const hookEvent = String(input.hook_event_name || input.hookEventName || input.event || "event");
   const branch = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
   const head = git(["rev-parse", "HEAD"], cwd);
@@ -41,7 +46,7 @@ async function main() {
   if (events.length) {
     await postJson(`${credentials.api}/developer-sessions/events`, credentials.token, {
       sessionId: sessionExternalId,
-      repo,
+      repo: repoInfo.repo,
       branch,
       head,
       client: "claude-code",
@@ -50,13 +55,17 @@ async function main() {
         hookEvent,
         pluginVersion: "0.1.0",
         captureTranscript: config.captureTranscript || false,
+        repoSource: repoInfo.source,
+        repoDetected: repoInfo.source !== "local",
       },
       events: events.slice(0, MAX_EVENTS_PER_POST),
     }).catch(() => {});
   }
 
   if (hookEvent === "PreToolUse" && String(input.tool_name || input.tool || "").toLowerCase() === "bash") {
-    await maybeRunCommitCheck(input, credentials, { cwd, repo, branch, head, sessionExternalId });
+    if (repoInfo.source !== "local") {
+      await maybeRunCommitCheck(input, credentials, { cwd, repo: repoInfo.repo, branch, head, sessionExternalId });
+    }
   }
 }
 
@@ -125,6 +134,27 @@ function normalizeEventType(name) {
     .replace(/([a-z])([A-Z])/g, "$1_$2")
     .replace(/[^A-Za-z0-9_:-]/g, "_")
     .toLowerCase();
+}
+
+function resolveRepo(cwd) {
+  const origin = git(["remote", "get-url", "origin"], cwd);
+  if (origin) return { repo: origin, source: "origin" };
+  const remotes = git(["remote", "-v"], cwd)
+    .split(/\r?\n/)
+    .map((line) => line.trim().split(/\s+/)[1])
+    .filter(Boolean);
+  if (remotes[0]) return { repo: remotes[0], source: "remote" };
+  const root = git(["rev-parse", "--show-toplevel"], cwd) || cwd || "workspace";
+  return { repo: localRepoLabel(root), source: "local" };
+}
+
+function localRepoLabel(value) {
+  const base = path.basename(String(value || "workspace")) || "workspace";
+  const safe = sanitizeText(base, 80)
+    .replace(/[^A-Za-z0-9_.-]/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60) || "workspace";
+  return `local/${safe}`;
 }
 
 function summarizeHookEvent(payload, hookEvent) {

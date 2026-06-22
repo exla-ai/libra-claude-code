@@ -3,35 +3,35 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs" }
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\"", "timeout": 10 }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs" }
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\"", "timeout": 10 }
         ]
       }
     ],
     "PostToolUse": [
       {
         "hooks": [
-          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs" }
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\"", "timeout": 10 }
         ]
       }
     ],
     "PostCompact": [
       {
         "hooks": [
-          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs" }
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\"", "timeout": 10 }
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs" }
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\"", "timeout": 10 }
         ]
       }
     ],
@@ -39,7 +39,7 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs" }
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\"", "timeout": 10 }
         ]
       }
     ]
