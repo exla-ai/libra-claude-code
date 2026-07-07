@@ -34,8 +34,8 @@ This is the normal install path. It installs:
 `/libra-login` stores the API key locally and adds or updates the MCP server with
 the same key. It also installs Libra hooks into `~/.codex/hooks.json` so native
 Codex sessions send the same sanitized event stream. After this, Claude Code can call `libra_query`,
-`libra_check_commit`, `libra_list_fix_offers`, `libra_view_session_events`, and
-`libra_accept_fix_offer`, and
+`libra_check_commit`, `libra_create_monitor`, `libra_list_sessions`, `libra_list_fix_offers`,
+`libra_view_session_events`, and `libra_accept_fix_offer`, and
 the local hook process can run commit checks when Claude Code attempts
 `git commit`.
 

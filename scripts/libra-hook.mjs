@@ -52,7 +52,7 @@ async function main() {
   }
 
   if (events.length) {
-    await postJson(`${credentials.api}/developer-sessions/events`, credentials.token, {
+    const response = await postJson(`${credentials.api}/developer-sessions/events`, credentials.token, {
       sessionId: sessionExternalId,
       repo: repoInfo.repo,
       branch,
@@ -69,7 +69,8 @@ async function main() {
         repoDetected: repoInfo.source !== "local",
       },
       events: events.slice(0, MAX_EVENTS_PER_POST),
-    }).catch(() => {});
+    }).catch(() => null);
+    if (hookEvent === "SessionStart") maybeEmitReviewNudge(response);
   }
 
   if (hookEvent === "PreToolUse" && String(input.tool_name || input.tool || "").toLowerCase() === "bash") {
@@ -347,6 +348,20 @@ async function maybeRunCommitCheck(input, credentials, context) {
     ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: note } }
     : { hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: note } };
   process.stdout.write(JSON.stringify(output));
+}
+
+// One line of session context when Libra fix PRs await review. Silent when the
+// queue is empty; the point is that the nudge only ever appears with work behind it.
+function maybeEmitReviewNudge(response) {
+  const queue = response?.reviewQueue;
+  const count = Number(queue?.unreviewed || 0);
+  if (!Number.isFinite(count) || count < 1) return;
+  const repos = Array.isArray(queue.repos) ? queue.repos.filter(Boolean).slice(0, 3) : [];
+  const where = repos.length ? ` in ${repos.join(", ")}` : "";
+  const note = `Libra has ${count} fix PR${count === 1 ? "" : "s"} awaiting review${where}. Run /libra-review to triage them with Libra's verification evidence.`;
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: note },
+  }));
 }
 
 function formatCommitNote(repo, findings, fixOffers) {
