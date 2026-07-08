@@ -350,17 +350,31 @@ async function maybeRunCommitCheck(input, credentials, context) {
   process.stdout.write(JSON.stringify(output));
 }
 
-// One line of session context when Libra fix PRs await review. Silent when the
-// queue is empty; the point is that the nudge only ever appears with work behind it.
+// Session-start context: what Libra is watching in prod right now, plus fix
+// PRs awaiting review. Silent when both are empty; the point is that the note
+// only ever appears with work or live risk behind it.
 function maybeEmitReviewNudge(response) {
+  const lines = [];
+
+  const risks = response?.activeRisks;
+  const riskCount = Number(risks?.count || 0);
+  const top = Array.isArray(risks?.top) ? risks.top.filter(Boolean).slice(0, 3) : [];
+  if (riskCount >= 1 && top.length) {
+    const items = top.map((r) => `[${r.severity || "unrated"} ${r.environment || "env"}] ${sanitizeText(r.title, 140)}`).join("; ");
+    lines.push(`Libra is watching ${riskCount} active production risk${riskCount === 1 ? "" : "s"} in this repo right now, top: ${items}. If the user asks about a prod symptom, ask Libra first (libra_query / libra_list_risks or /libra) - it may already have the trace.`);
+  }
+
   const queue = response?.reviewQueue;
   const count = Number(queue?.unreviewed || 0);
-  if (!Number.isFinite(count) || count < 1) return;
-  const repos = Array.isArray(queue.repos) ? queue.repos.filter(Boolean).slice(0, 3) : [];
-  const where = repos.length ? ` in ${repos.join(", ")}` : "";
-  const note = `Libra has ${count} fix PR${count === 1 ? "" : "s"} awaiting review${where}. Run /libra-review to triage them with Libra's verification evidence.`;
+  if (Number.isFinite(count) && count >= 1) {
+    const repos = Array.isArray(queue.repos) ? queue.repos.filter(Boolean).slice(0, 3) : [];
+    const where = repos.length ? ` in ${repos.join(", ")}` : "";
+    lines.push(`Libra has ${count} fix PR${count === 1 ? "" : "s"} awaiting review${where}. Run /libra-review to triage them with Libra's verification evidence.`);
+  }
+
+  if (!lines.length) return;
   process.stdout.write(JSON.stringify({
-    hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: note },
+    hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: lines.join("\n") },
   }));
 }
 
