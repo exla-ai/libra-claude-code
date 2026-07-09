@@ -71,6 +71,7 @@ async function main() {
       events: events.slice(0, MAX_EVENTS_PER_POST),
     }).catch(() => null);
     if (hookEvent === "SessionStart") maybeEmitReviewNudge(response);
+    if (hookEvent === "UserPromptSubmit") maybeEmitPromptMatches(response);
   }
 
   if (hookEvent === "PreToolUse" && String(input.tool_name || input.tool || "").toLowerCase() === "bash") {
@@ -340,14 +341,51 @@ async function maybeRunCommitCheck(input, credentials, context) {
     diffSummary,
   }).catch(() => null);
   const findings = Array.isArray(body?.findings) ? body.findings : [];
-  if (!findings.length) return;
+  const overlaps = Array.isArray(body?.overlappingFixPrs) ? body.overlappingFixPrs : [];
+  if (!findings.length && !overlaps.length) return;
 
-  const note = formatCommitNote(context.repo, findings, body.fixOffers || []);
+  const parts = [];
+  if (findings.length) parts.push(formatCommitNote(context.repo, findings, body.fixOffers || []));
+  if (overlaps.length) parts.push(formatOverlapNote(overlaps));
+  const note = parts.join("\n\n");
   const top = topSeverity(findings);
   const output = top === "critical" || top === "high"
     ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: note } }
     : { hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: note } };
   process.stdout.write(JSON.stringify(output));
+}
+
+// The staged files collide with files an open Libra fix PR also changes.
+// Surfaced before the commit so the developer reviews or reconciles first
+// instead of discovering the conflict at merge time.
+function formatOverlapNote(overlaps) {
+  const lines = overlaps.slice(0, 3).map((o) => {
+    const files = (o.overlappingFiles || []).slice(0, 4).join(", ");
+    return `- PR #${o.prNumber} (${sanitizeText(o.title, 120)}) also changes: ${files}`;
+  });
+  return `Open Libra fix PRs touch the same files as this commit:\n${lines.join("\n")}\nConsider /libra-review for these PRs before or right after committing, so the fixes get reconciled instead of colliding.`;
+}
+
+// Relevance-gated injection: the server matched the user's own prompt words
+// against Libra's open fix PRs and incident candidates for this repo. Silent
+// on no match; when it fires, the coding agent starts the turn already
+// knowing Libra holds something directly relevant.
+function maybeEmitPromptMatches(response) {
+  const matches = response?.promptMatches;
+  if (!matches) return;
+  const lines = [];
+  for (const pr of (Array.isArray(matches.fixPrs) ? matches.fixPrs : []).slice(0, 2)) {
+    const ci = pr.ciRollup ? `, own CI ${pr.ciRollup}` : "";
+    const reviewed = pr.reviewed ? "" : " (unreviewed)";
+    lines.push(`Libra has an open fix PR for what the user is asking about: #${pr.prNumber} ${sanitizeText(pr.title, 120)}${ci}${reviewed}. Evidence: libra_pr_evidence; triage: /libra-review ${pr.prNumber}.`);
+  }
+  for (const risk of (Array.isArray(matches.risks) ? matches.risks : []).slice(0, 3)) {
+    lines.push(`Libra is already tracking this: [${risk.severity || "unrated"} ${risk.environment || "env"} ${risk.status || ""}] ${sanitizeText(risk.title, 140)}${risk.summary ? ` - ${sanitizeText(risk.summary, 160)}` : ""}. Ask libra_query for the full trace before re-deriving it.`);
+  }
+  if (!lines.length) return;
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: lines.join("\n") },
+  }));
 }
 
 // Session-start context: what Libra is watching in prod right now, plus fix
