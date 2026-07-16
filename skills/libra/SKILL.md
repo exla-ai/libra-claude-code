@@ -8,6 +8,12 @@ Libra is the user's production ops system for their AWS and GitHub. Answers must
 
 1. Prefer MCP tools when connected:
    - `libra_query`
+   - `libra_list_risks` (calibrated risk register, the authoritative "any prod risks right now" view)
+   - `libra_runtime_health` (live ECS/ALB control plane: stopped tasks with exit codes, service events, unhealthy targets)
+   - `libra_query_traces` (real OTEL error traces: is it firing, since when, who is hit, exemplar trace ids)
+   - `libra_query_logs` (live CloudWatch Logs Insights for a concrete error string)
+   - `libra_task_forensics` (task deaths: kill cadence, memory spike-vs-leak verdict, which job was running at each death)
+   - `libra_recent_deploys` (deploy timing vs symptom timing)
    - `libra_check_commit`
    - `libra_create_monitor`
    - `libra_list_sessions`
@@ -24,9 +30,10 @@ Libra is the user's production ops system for their AWS and GitHub. Answers must
    - `POST /developer-sessions/:sessionId/analyze` for current session intents and risks.
    - `GET /developer-sessions/:sessionId/fix-offers` for open offers.
    - `POST /developer-sessions/fix-offers/:id/accept` only after the user explicitly accepts.
-4. Never invent counts, PRs, user IDs, or telemetry. If Libra has no data, say that directly.
-5. Do not apply a suggested fix without asking the user first. On approval, use normal Claude Code editing tools to patch locally.
-6. When the user wants Libra's fix PRs reviewed, follow the `/libra-review` command: review the actual diff independently against the evidence, never rubber-stamp a sandbox pass whose changed surfaces were not exercised, and never merge or close without an explicit yes.
+4. For current-state or proof questions, chase live evidence: `libra_query` reads Libra's incident history, while `libra_runtime_health`, `libra_query_traces`, `libra_query_logs`, `libra_task_forensics`, and `libra_recent_deploys` query AWS and ClickHouse just-in-time. Chain as many as the question needs. A failed or unavailable fetch means unknown, never healthy.
+5. Never invent counts, PRs, user IDs, or telemetry. If Libra has no data, say that directly.
+6. Do not apply a suggested fix without asking the user first. On approval, use normal Claude Code editing tools to patch locally.
+7. When the user wants Libra's fix PRs reviewed, follow the `/libra-review` command: review the actual diff independently against the evidence, never rubber-stamp a sandbox pass whose changed surfaces were not exercised, and never merge or close without an explicit yes.
 
 ## Response Style
 
