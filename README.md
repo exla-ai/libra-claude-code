@@ -192,7 +192,9 @@ turn and a watched PR's review is still running, a background Stop hook (`async`
 lands, it wakes the idle session and Claude tells you, in the same shape, without you
 typing anything. It never wakes for a review another hook already showed, one
 watcher runs per session, and it stops early when nothing is left to wait for. It
-dies with the session, so the review also stays on the PR on GitHub.
+dies with the session, so the review also stays on the PR on GitHub. It needs Claude
+Code 2.1.287 or newer (read from the session transcript) and stays off on older
+versions, which may not run hooks in the background.
 
 What the plugin sends for this: the PR numbers it noticed (`watch.prs`) with each
 event batch. A repo with no GitHub remote has no PRs to watch. Each block shown is

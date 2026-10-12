@@ -264,7 +264,7 @@ test("SessionStart shows a visible Libra block, the intro once, and records what
 
     await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUse", session_id: "sess-a", cwd: repo, tool_name: "Read" } });
     const flushed = requests.at(-1).body;
-    assert.equal(flushed.metadata.pluginVersion, "0.3.0");
+    assert.equal(flushed.metadata.pluginVersion, "0.3.1");
     // sess-a showed two session_start notes (startup, then context-only after compaction).
     const surfaced = flushed.events.filter((e) => e.type === "libra_surfaced");
     assert.equal(surfaced.length, 1);
@@ -1676,7 +1676,7 @@ test("The Stop hook is registered, and the Codex installer is unchanged", () => 
 
 // Background review watcher (Stop, async + asyncRewake): wakes an idle session
 // once when Libra's review of a watched PR lands.
-async function runWatcher({ api, home, cwd, sid, env: extraEnv = {} }) {
+async function runWatcher({ api, home, cwd, sid, env: extraEnv = {}, claudeVersion = "2.1.296" }) {
   const env = { ...process.env, HOME: home, LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test", LIBRA_HOOK_WATCH_POLL_MS: "40", LIBRA_HOOK_WATCH_MAX_MS: "4000", ...extraEnv };
   delete env.CLAUDE_CODE_SESSION_ID;
   const child = spawn("node", [HOOK, "watch"], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
@@ -1684,7 +1684,9 @@ async function runWatcher({ api, home, cwd, sid, env: extraEnv = {} }) {
   let stderr = "";
   child.stdout.on("data", (chunk) => { stdout += chunk; });
   child.stderr.on("data", (chunk) => { stderr += chunk; });
-  child.stdin.end(JSON.stringify({ hook_event_name: "Stop", session_id: sid, cwd }));
+  const transcript = path.join(home, `${sid}.jsonl`);
+  if (!fs.existsSync(transcript)) fs.writeFileSync(transcript, `${JSON.stringify({ type: "user", version: claudeVersion })}\n`);
+  child.stdin.end(JSON.stringify({ hook_event_name: "Stop", session_id: sid, cwd, transcript_path: transcript }));
   const code = await new Promise((resolve) => child.on("exit", resolve));
   return { code, stdout, stderr };
 }
@@ -1778,5 +1780,20 @@ test("the watcher stops early when nothing is reviewing and the review was alrea
     assert.equal(out.code, 0);
     assert.equal(out.stderr, "");
     assert.ok(requests.length - before <= 4, "it gave up after the grace polls instead of waiting out its deadline");
+  });
+});
+
+test("the watcher never runs on a Claude Code too old for background hooks, or one it cannot identify", async () => {
+  const repo = makeRepo();
+  await withApi({ [EVENTS]: () => ({ ok: true, inbox: { prs: [{ prNumber: 3045, state: "reviewing" }] } }) }, async (api, requests) => {
+    for (const [label, claudeVersion] of [["old", "2.0.99"], ["unknown", "not-a-version"]]) {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+      const sid = `sess-${label}`;
+      seedWatch(home, sid);
+      const before = requests.length;
+      const out = await runWatcher({ api, home, cwd: repo, sid, claudeVersion });
+      assert.equal(out.code, 0, `${label} version exits at once`);
+      assert.equal(requests.length, before, `${label} version makes no request`);
+    }
   });
 });

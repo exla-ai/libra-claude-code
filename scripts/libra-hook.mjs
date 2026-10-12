@@ -11,7 +11,7 @@ const MAX_EVENTS_PER_POST = 40;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "0.3.0";
+const PLUGIN_VERSION = "0.3.1";
 const MAX_PENDING_SURFACED = 10;
 const FEEDBACK_ASK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // Feedback attaches to the last note Libra showed only while that note is recent.
@@ -34,6 +34,11 @@ const WATCH_LOCK_STALE_MS = 3 * 60_000;
 // The first polls do not give up on "nothing reviewing": a fresh push can take
 // a moment to become a sandbox run.
 const WATCH_GRACE_POLLS = 2;
+// The watcher relies on hooks.json's `async` and `asyncRewake`. A Claude Code
+// that predates them may run the hook in the foreground, where a 25-minute
+// wait would hold the end of every turn, so it only runs at or above this
+// (2.1.287 fixed `asyncRewake` hooks; tested on 2.1.296).
+const MIN_ASYNC_REWAKE_VERSION = [2, 1, 287];
 // Unsent notes older than this are dropped; they no longer describe the session.
 const PENDING_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const PENDING_TMP_MAX_AGE_MS = 60 * 60 * 1000;
@@ -211,6 +216,7 @@ async function main() {
         transcriptPathDetected: Boolean(transcriptPath),
         repoSource: repoInfo.source,
         repoDetected: repoInfo.source !== "local",
+        ...(agent === "claude-code" && claudeCodeVersion(transcriptPath) ? { clientVersion: claudeCodeVersion(transcriptPath).join(".") } : {}),
       },
       events: sendEvents,
       ...(watchedPrs.length ? { watch: { prs: watchedPrs } } : {}),
@@ -1459,6 +1465,7 @@ async function runWatch() {
   if (repoInfo.source === "local") return;
   const sessionExternalId = String(input.session_id || input.sessionId || process.env.CLAUDE_CODE_SESSION_ID || "");
   if (!sessionExternalId || !readWatchedPrs(sessionExternalId).length) return;
+  if (!versionAtLeast(claudeCodeVersion(input.transcript_path), MIN_ASYNC_REWAKE_VERSION)) return;
   const lock = acquireWatcherLock(sessionExternalId);
   if (!lock) return;
   const context = { sessionExternalId, repo: repoInfo.repo, agent: "claude-code", visible: true };
@@ -1521,6 +1528,35 @@ function wakeMessage(entries, context) {
     );
   }
   return null;
+}
+
+// Claude Code writes its version on every transcript line; the last one wins.
+// Unknown (no transcript, unreadable, no field) returns null.
+function claudeCodeVersion(transcriptPath) {
+  if (!transcriptPath) return null;
+  try {
+    const fd = fs.openSync(String(transcriptPath), "r");
+    try {
+      const size = fs.fstatSync(fd).size;
+      const length = Math.min(size, 65_536);
+      const buffer = Buffer.alloc(length);
+      fs.readSync(fd, buffer, 0, length, size - length);
+      const match = [...buffer.toString("utf8").matchAll(/"version":"(\d{1,4})\.(\d{1,4})\.(\d{1,6})"/g)].at(-1);
+      return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+function versionAtLeast(version, minimum) {
+  if (!version) return false;
+  for (let i = 0; i < minimum.length; i += 1) {
+    if (version[i] !== minimum[i]) return version[i] > minimum[i];
+  }
+  return true;
 }
 
 function watcherLockPath(sessionExternalId) {
