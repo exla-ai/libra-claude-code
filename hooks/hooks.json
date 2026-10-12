@@ -31,7 +31,8 @@
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" claude-code", "timeout": 10 }
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" claude-code", "timeout": 10 },
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" watch", "async": true, "asyncRewake": true, "timeout": 1800 }
         ]
       }
     ],

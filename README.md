@@ -186,9 +186,17 @@ say yes. This happens at most once per review (and never when a Libra Stop hook
 already continued the turn). Clean reviews never do this. Codex gets the review as
 context only: no visible block and no Stop hook.
 
+**A review that lands while you are away wakes the session.** When Claude finishes a
+turn and a watched PR's review is still running, a background Stop hook (`async`,
+`asyncRewake`) checks Libra every 45 seconds for up to 25 minutes. When the review
+lands, it wakes the idle session and Claude tells you, in the same shape, without you
+typing anything. It never wakes for a review another hook already showed, one
+watcher runs per session, and it stops early when nothing is left to wait for. It
+dies with the session, so the review also stays on the PR on GitHub.
+
 What the plugin sends for this: the PR numbers it noticed (`watch.prs`) with each
 event batch. A repo with no GitHub remote has no PRs to watch. Each block shown is
-recorded as a `libra_surfaced` note (`pr_watch`, `pr_review`, `pr_review_stop`) with
+recorded as a `libra_surfaced` note (`pr_watch`, `pr_review`, `pr_review_stop`, `pr_review_wake`) with
 the PR number and run id.
 
 ## Feedback

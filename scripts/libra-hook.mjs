@@ -11,7 +11,7 @@ const MAX_EVENTS_PER_POST = 40;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "0.2.0";
+const PLUGIN_VERSION = "0.3.0";
 const MAX_PENDING_SURFACED = 10;
 const FEEDBACK_ASK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // Feedback attaches to the last note Libra showed only while that note is recent.
@@ -23,6 +23,17 @@ const HOOK_STARTED_AT = Date.now();
 const NETWORK_DEADLINE_MS = Number(process.env.LIBRA_HOOK_NETWORK_DEADLINE_MS) || 8_000;
 const MIN_REQUEST_BUDGET_MS = 250;
 const HARD_EXIT_MS = NETWORK_DEADLINE_MS + 1_300;
+// Background review watcher (Stop, async + asyncRewake in hooks.json). PR
+// sandbox runs average about 18 minutes, so it waits up to 25 minutes, under
+// the hook's 30-minute timeout, checking once every 45 seconds.
+const WATCH_MAX_MS = Number(process.env.LIBRA_HOOK_WATCH_MAX_MS) || 25 * 60_000;
+const WATCH_POLL_MS = Number(process.env.LIBRA_HOOK_WATCH_POLL_MS) || 45_000;
+const WATCH_REQUEST_MS = 8_000;
+// A live watcher refreshes its lock every poll; one this old has died.
+const WATCH_LOCK_STALE_MS = 3 * 60_000;
+// The first polls do not give up on "nothing reviewing": a fresh push can take
+// a moment to become a sandbox run.
+const WATCH_GRACE_POLLS = 2;
 // Unsent notes older than this are dropped; they no longer describe the session.
 const PENDING_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const PENDING_TMP_MAX_AGE_MS = 60 * 60 * 1000;
@@ -102,14 +113,20 @@ const FEEDBACK_RATINGS = [
   ["useful", /^(?:(?:useful|helpful|\+1)(?=$|[\s,:;!?]|\.(?:\s|$))|\u{1F44D}[\u{1F3FB}-\u{1F3FF}\uFE0F]*)/iu],
 ];
 
-// A hook that hangs must still let Claude Code move on.
-setTimeout(() => process.exit(0), HARD_EXIT_MS).unref();
+// A hook that hangs must still let Claude Code move on. The background
+// review watcher (`watch`) runs far longer by design and has its own ceiling.
+const WATCH_MODE = process.argv[2] === "watch";
+setTimeout(() => process.exit(0), WATCH_MODE ? WATCH_MAX_MS + 60_000 : HARD_EXIT_MS).unref();
 
 main().catch(() => process.exit(0));
 
 async function main() {
   if (process.argv[2] === "feedback") {
     await runFeedback(process.argv.slice(3));
+    return;
+  }
+  if (WATCH_MODE) {
+    await runWatch();
     return;
   }
   const input = readJsonFromStdin();
@@ -1425,6 +1442,120 @@ function prStopOutput(entries, context, input) {
   return { decision: "block", reason };
 }
 
+// Stop, in the background (hooks.json: async, asyncRewake). After Claude
+// finishes a turn, wait for Libra's review of a watched PR that is still
+// running, then wake the idle session: exit code 2 hands stderr to Claude,
+// which tells the developer. One watcher per session, and every review is
+// delivered once across all hooks, so a review already shown never wakes.
+async function runWatch() {
+  const input = readJsonFromStdin();
+  if (!input) return;
+  const cwd = input.cwd || process.cwd();
+  const config = readConfig(cwd);
+  if (config.enabled === false) return;
+  const credentials = readCredentials();
+  if (!credentials.token) return;
+  const repoInfo = resolveRepo(cwd);
+  if (repoInfo.source === "local") return;
+  const sessionExternalId = String(input.session_id || input.sessionId || process.env.CLAUDE_CODE_SESSION_ID || "");
+  if (!sessionExternalId || !readWatchedPrs(sessionExternalId).length) return;
+  const lock = acquireWatcherLock(sessionExternalId);
+  if (!lock) return;
+  const context = { sessionExternalId, repo: repoInfo.repo, agent: "claude-code", visible: true };
+  const deadline = Date.now() + WATCH_MAX_MS;
+  let polls = 0;
+  try {
+    while (Date.now() < deadline) {
+      const watchedPrs = readWatchedPrs(sessionExternalId);
+      if (!watchedPrs.length) return;
+      touchWatcherLock(lock);
+      const response = await postJson(`${credentials.api}/developer-sessions/events`, credentials.token, {
+        sessionId: sessionExternalId,
+        repo: repoInfo.repo,
+        client: "claude-code",
+        cwd,
+        metadata: { agent: "claude-code", hookEvent: "StopWatch", pluginVersion: PLUGIN_VERSION, repoSource: repoInfo.source, repoDetected: true },
+        events: [],
+        watch: { prs: watchedPrs },
+      }, WATCH_REQUEST_MS).catch(() => null);
+      polls += 1;
+      const entries = response ? parseInbox(response) : [];
+      const wake = wakeMessage(entries, context);
+      if (wake) {
+        releaseWatcherLock(lock);
+        // stderr to a pipe is asynchronous on macOS: exit only once it is flushed.
+        await new Promise((resolve) => process.stderr.write(`${wake}\n`, resolve));
+        process.exit(2);
+      }
+      if (response && polls > WATCH_GRACE_POLLS && !entries.some((entry) => entry.state === "reviewing")) return;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(WATCH_POLL_MS, Math.max(0, deadline - Date.now()))));
+    }
+  } finally {
+    releaseWatcherLock(lock);
+  }
+}
+
+// The first finished review of a watched PR that no hook has shown yet. Taking
+// the review claim here keeps every other hook from showing it again, and the
+// stop claim keeps the Stop hook from raising it a second time.
+function wakeMessage(entries, context) {
+  const repoKey = shortRepo(context.repo).toLowerCase();
+  for (const entry of entries) {
+    if (entry.state !== "reviewed") continue;
+    if (!claimDelivery(`review|${repoKey}|${entry.prNumber}|${entry.runId}`)) continue;
+    claimDelivery(`stop|${repoKey}|${entry.prNumber}|${entry.runId}`);
+    recordPrNote(context, "pr_review_wake", entry, "", [reviewTitle(entry)]);
+    const clean = !entry.issues.length && !entry.failureObserved;
+    if (clean) {
+      const score = entry.score != null ? ` (Confidence ${entry.score}/5)` : "";
+      return libraContext(
+        context.repo,
+        [`Libra's finished review of PR #${entry.prNumber}${score}: no issues found in what Libra ran.`],
+        `Libra's review of PR #${entry.prNumber} finished while the session was idle. Tell the developer in one short line that it came back clean${score}, crediting Libra. Do not start any other work.`,
+      );
+    }
+    return libraContext(
+      context.repo,
+      reviewContextLines(entry, 1).lines,
+      "Libra's review of this PR finished while the session was idle. Tell the developer about it briefly, using the shape below, and ask whether they want the issues fixed. Do not change any code until they say yes.",
+    );
+  }
+  return null;
+}
+
+function watcherLockPath(sessionExternalId) {
+  return path.join(stateDir(), `${hash(sessionExternalId)}.watcher`);
+}
+
+// One watcher per session: an exclusive create wins, and a lock whose owner
+// stopped refreshing it is taken over.
+function acquireWatcherLock(sessionExternalId) {
+  const file = watcherLockPath(sessionExternalId);
+  const token = `${process.pid}:${Date.now()}`;
+  try {
+    fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+    try {
+      fs.writeFileSync(file, token, { flag: "wx", mode: 0o600 });
+      return { file, token };
+    } catch (error) {
+      if (error?.code !== "EEXIST") return null;
+      if (Date.now() - fs.statSync(file).mtimeMs < WATCH_LOCK_STALE_MS) return null;
+      fs.writeFileSync(file, token, { mode: 0o600 });
+      return { file, token };
+    }
+  } catch {
+    return null;
+  }
+}
+
+function touchWatcherLock(lock) {
+  try { const now = new Date(); fs.utimesSync(lock.file, now, now); } catch {}
+}
+
+function releaseWatcherLock(lock) {
+  try { if (fs.readFileSync(lock.file, "utf8") === lock.token) fs.unlinkSync(lock.file); } catch {}
+}
+
 function prInboxOutput(response, hookEvent, input, context) {
   try {
     if (!response) return null;
@@ -1538,8 +1669,8 @@ function networkBudgetMs() {
   return NETWORK_DEADLINE_MS - (Date.now() - HOOK_STARTED_AT);
 }
 
-async function postJson(url, token, body) {
-  const budget = networkBudgetMs();
+async function postJson(url, token, body, budgetMs) {
+  const budget = budgetMs ?? networkBudgetMs();
   // Not enough time left to finish a request: skip it rather than outlive the hook.
   if (budget < MIN_REQUEST_BUDGET_MS) return null;
   const controller = new AbortController();

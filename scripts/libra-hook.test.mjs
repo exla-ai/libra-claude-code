@@ -264,7 +264,7 @@ test("SessionStart shows a visible Libra block, the intro once, and records what
 
     await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUse", session_id: "sess-a", cwd: repo, tool_name: "Read" } });
     const flushed = requests.at(-1).body;
-    assert.equal(flushed.metadata.pluginVersion, "0.2.0");
+    assert.equal(flushed.metadata.pluginVersion, "0.3.0");
     // sess-a showed two session_start notes (startup, then context-only after compaction).
     const surfaced = flushed.events.filter((e) => e.type === "libra_surfaced");
     assert.equal(surfaced.length, 1);
@@ -1664,7 +1664,119 @@ test("An unreachable or confused server leaves PR reviews silent and does not us
 
 test("The Stop hook is registered, and the Codex installer is unchanged", () => {
   const hooks = JSON.parse(fs.readFileSync(path.join(ROOT, "hooks", "hooks.json"), "utf8")).hooks;
-  assert.deepEqual(hooks.Stop, [{ hooks: [{ type: "command", command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs" claude-code', "timeout": 10 }] }]);
+  assert.deepEqual(hooks.Stop, [{ hooks: [
+    { type: "command", command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs" claude-code', "timeout": 10 },
+    // The background review watcher: async so the turn ends at once, asyncRewake
+    // so a review that lands while the session is idle wakes Claude.
+    { type: "command", command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs" watch', async: true, asyncRewake: true, timeout: 1800 },
+  ] }]);
   for (const event of ["SessionStart", "UserPromptSubmit", "PostToolUse", "PreToolUse", "PostCompact", "SessionEnd"]) assert.ok(hooks[event], `${event} is still registered`);
   assert.equal(hooks.PostToolUse[0].hooks[0].command, hooks.Stop[0].hooks[0].command, "one script handles every event");
+});
+
+// Background review watcher (Stop, async + asyncRewake): wakes an idle session
+// once when Libra's review of a watched PR lands.
+async function runWatcher({ api, home, cwd, sid, env: extraEnv = {} }) {
+  const env = { ...process.env, HOME: home, LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test", LIBRA_HOOK_WATCH_POLL_MS: "40", LIBRA_HOOK_WATCH_MAX_MS: "4000", ...extraEnv };
+  delete env.CLAUDE_CODE_SESSION_ID;
+  const child = spawn("node", [HOOK, "watch"], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.end(JSON.stringify({ hook_event_name: "Stop", session_id: sid, cwd }));
+  const code = await new Promise((resolve) => child.on("exit", resolve));
+  return { code, stdout, stderr };
+}
+
+function seedWatch(home, sid, pr = 3045) {
+  const dir = path.join(home, ".config/libra/coding-agent", `${sessionHash(sid)}.watch`);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${pr}.json`), JSON.stringify({ pr, seenAt: Date.now() }));
+}
+
+test("the watcher exits at once, without a request, when the session watches no PR", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  await withApi({ [EVENTS]: () => ({ ok: true }) }, async (api, requests) => {
+    const out = await runWatcher({ api, home, cwd: repo, sid: "sess-idle" });
+    assert.equal(out.code, 0);
+    assert.equal(out.stderr, "");
+    assert.equal(requests.length, 0);
+  });
+});
+
+test("the watcher waits while the review runs, then wakes Claude once with the finished review", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-wake";
+  seedWatch(home, sid);
+  let calls = 0;
+  await withApi({
+    [EVENTS]: (body) => {
+      if (body.metadata?.hookEvent !== "StopWatch") return { ok: true, inbox: { prs: [reviewedEntry({ runId: "run-wake" })] } };
+      calls += 1;
+      assert.deepEqual(body.watch, { prs: [3045] });
+      assert.deepEqual(body.events, []);
+      return { ok: true, inbox: { prs: [calls < 3 ? { prNumber: 3045, state: "reviewing" } : reviewedEntry({ runId: "run-wake" })] } };
+    },
+  }, async (api) => {
+    const out = await runWatcher({ api, home, cwd: repo, sid });
+    assert.equal(out.code, 2, "exit 2 wakes the idle session");
+    assert.match(out.stderr, /<libra source=/);
+    assert.match(out.stderr, /Libra's finished review of PR #3045 \(run run-wake/);
+    assert.match(out.stderr, /Gmail thread reads return 404/);
+    assert.match(out.stderr, /finished while the session was idle[\s\S]*Do not change any code until they say yes/);
+    assert.ok(calls >= 3, "it polled while the review was running");
+
+    // The review is now delivered: a later hook does not show it again, and a
+    // second watcher does not wake for it.
+    const later = JSON.parse((await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUse", session_id: sid, cwd: repo, tool_name: "Read" } })).stdout || "{}");
+    assert.doesNotMatch(later.systemMessage || "", /review of PR #3045/);
+    const again = await runWatcher({ api, home, cwd: repo, sid });
+    assert.equal(again.code, 0);
+    assert.equal(again.stderr, "");
+  });
+});
+
+test("a clean review wakes Claude with a one-line instruction", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-clean";
+  seedWatch(home, sid);
+  await withApi({ [EVENTS]: () => ({ ok: true, inbox: { prs: [reviewedEntry({ runId: "run-clean", score: 5, issues: [], issueCount: 0, failureObserved: false })] } }) }, async (api) => {
+    const out = await runWatcher({ api, home, cwd: repo, sid });
+    assert.equal(out.code, 2);
+    assert.match(out.stderr, /PR #3045 \(Confidence 5\/5\): no issues found in what Libra ran/);
+    assert.match(out.stderr, /one short line that it came back clean/);
+  });
+});
+
+test("only one watcher runs per session", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-lock";
+  seedWatch(home, sid);
+  await withApi({ [EVENTS]: () => ({ ok: true, inbox: { prs: [{ prNumber: 3045, state: "reviewing" }] } }) }, async (api) => {
+    const first = runWatcher({ api, home, cwd: repo, sid, env: { LIBRA_HOOK_WATCH_MAX_MS: "1500" } });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const second = await runWatcher({ api, home, cwd: repo, sid });
+    assert.equal(second.code, 0, "a second watcher leaves while the first holds the lock");
+    assert.equal((await first).code, 0, "the first gives up quietly at its deadline");
+  });
+});
+
+test("the watcher stops early when nothing is reviewing and the review was already shown", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-shown";
+  seedWatch(home, sid);
+  await withApi({ [EVENTS]: () => ({ ok: true, inbox: { prs: [reviewedEntry({ runId: "run-shown" })] } }) }, async (api, requests) => {
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUse", session_id: sid, cwd: repo, tool_name: "Read" } });
+    const before = requests.length;
+    const out = await runWatcher({ api, home, cwd: repo, sid, env: { LIBRA_HOOK_WATCH_MAX_MS: "60000" } });
+    assert.equal(out.code, 0);
+    assert.equal(out.stderr, "");
+    assert.ok(requests.length - before <= 4, "it gave up after the grace polls instead of waiting out its deadline");
+  });
 });
