@@ -1,6 +1,6 @@
 {
   "name": "libra-claude-code",
-  "description": "Libra inside Claude Code: checks your commits against your own production history, derives what you were trying to do, and answers questions about your live services. Advisory and fail-open.",
+  "description": "Libra inside Claude Code: checks your commits against your own production history, derives what you were trying to do, and answers questions about your live services. Fail-open.",
   "author": {
     "name": "Libra",
     "url": "https://libra.exla.ai"

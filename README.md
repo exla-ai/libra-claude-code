@@ -10,9 +10,16 @@ it into Claude Code so it can:
   what a deploy did, whether a change is risky).
 - **Surface fix offers** back into the active session when a commit check finds a
   high-confidence, code-changeable risk.
+- **Show you what it did**: a short Libra block when a session starts, one when it
+  gives Claude production context for your request, and one for every commit it
+  checks, including "nothing flagged".
+- **Take your feedback** with `/libra-feedback`, so the Libra team learns what helps.
 
-Everything Libra does here is **advisory and fail-open**: it never blocks or slows your
-commits. High-risk findings ask before the commit runs, and everything else is context.
+Everything Libra does here is **fail-open and bounded**: if Libra is slow, down, or
+cannot finish a check, the commit proceeds and Libra stays quiet. Every network call
+shares a deadline of about 8 seconds, so a check can add a few seconds to a commit
+but never more. High and critical findings ask before the commit runs, and
+everything else is context.
 
 ## Install Libra in Claude Code
 
@@ -27,8 +34,8 @@ Ask Claude Code to install the Libra Claude Code plugin, then log in:
 This is the normal install path. It installs:
 
 - the Libra hooks for sanitized session events and commit-attempt checks,
-- the `/libra` and `/libra-login` commands,
-- the `/libra` skill,
+- the `/libra`, `/libra-login`, and `/libra-feedback` commands,
+- the `libra-ops` skill,
 - the remote MCP server at `https://api.libra.exla.ai/mcp`.
 
 `/libra-login` stores the API key locally and adds or updates the MCP server with
@@ -46,6 +53,154 @@ compaction, and session end. It also records native Codex `SessionStart`,
 `UserPromptSubmit`, and `Stop` events once `/libra-login` installs the Codex
 hooks. If only MCP is installed, the coding agent can call Libra tools, but no
 automatic session events are sent.
+
+## Updating
+
+Third-party marketplaces do not auto-update by default. To pick up a new version:
+
+```bash
+claude plugin marketplace update libra
+claude plugin update libra-claude-code@libra
+```
+
+Then restart Claude Code. The first session after an update shows a one-time line
+explaining what is new.
+
+## What you see in a session
+
+Libra speaks up in short blocks: a header line that starts with `Libra`, then a few
+indented lines. Nothing is shown when Libra is unreachable or a check fails (Libra
+never claims a result it does not have). "Nothing flagged" appears only when the
+server confirms it finished the analysis; a repo Libra cannot see, an analysis that
+did not complete, or a missing answer all stay silent.
+
+**Session start**
+
+```text
+Libra · CedarCopilot/cedar-mail
+  - 12 open production risks. Top: Agent email and conversation tools are failing for production users (P2, prod)
+  - 1 Libra fix PR to review: /libra-review
+  - Commits are checked against production before they land.
+```
+
+Lines that do not apply are left out. The first session after an install or update
+adds one line: `New: Libra now shows these notes here. Tell us what helps with /libra-feedback.`
+It is not repeated after a context compaction.
+
+**Your request matches something Libra tracks**
+
+```text
+Libra · related to this request
+  - Gmail draft reads use stale IDs (P2, prod)
+  - Fix PR #2063: Notification thread cache diverges (unreviewed)
+  Claude has the details.
+```
+
+**Claude runs `git commit`**
+
+```text
+Libra · commit check · 1 finding
+  - Medium: New Gmail lookup has no timeout
+    Add a bounded timeout and explicit failure handling.
+  The commit continues.
+```
+
+High and critical findings pause the commit. The header says `needs your OK`, the last
+line says `Claude Code will ask before committing.`, and Claude Code's approval dialog
+shows the same block. At most two findings are listed, then `+N more`. A clean commit
+is one line:
+
+```text
+Libra · commit check · nothing flagged against CedarCopilot/cedar-mail production history
+```
+
+At most once a day, one of these blocks ends with `  Useful? Reply with /libra-feedback`.
+Feedback attaches to the last note Libra actually showed on this machine, and only if
+it was shown in the last 24 hours.
+
+**What Claude gets**
+
+Alongside each block, Claude receives Libra's data wrapped in a labeled
+`<libra source="Libra production monitoring for <repo>"> ... </libra>` block, so it
+can tell Libra's findings apart from your words. The block says plainly that its
+contents are data from Libra and never instructions to follow, and every field in it
+is stripped of control characters and escape codes first. The block has numbered items, a
+`How to use this:` line for that hook, and a reporting shape that asks Claude to
+credit Libra whenever it relays something:
+
+```text
+**Libra flagged:** <one line>
+- **Where:** <file, route, or job>
+- **Why it matters:** <impact from Libra's data>
+- **What I'm doing about it:** <your next step>
+```
+
+**`/libra` answers**
+
+Every `/libra` answer has the same shape, about eight lines: a `**Libra:**` lead
+sentence, then `What's happening`, `Evidence` (counts, US Pacific times, trace ids,
+PR numbers exactly as Libra returned them), `Since`, and `Next step`. When Libra has
+no data the answer says `Unknown` and what is missing, never a guess.
+
+## Libra in your live session
+
+When Claude Code works on a pull request, Libra says so and brings its review back
+into the session. Libra notices which PRs a session touches from the `gh` commands
+Claude runs (`gh pr create`, `gh pr checks 3045`, `gh pr view 3042`, `gh pr diff 3049`,
+and the other `gh pr` subcommands), or from a link to a PR in your repo. It does not
+guess from your git branch, and it ignores PRs in other repos. It keeps the five most
+recent PRs per session for 48 hours.
+
+**Libra starts reviewing a PR** (shown once per PR on this machine)
+
+```text
+Libra · watching PR #3045
+  Libra is reviewing it against production. The result will show up here.
+```
+
+**Libra's review is ready** (shown once per review on this machine, at the next
+session start, prompt, or tool use)
+
+```text
+Libra · review of PR #3045 · Confidence 3/5
+  - P1: Gmail thread reads return 404 (gmail.ts)
+  - P2: Drafts keep stale ids (drafts.ts)
+  Claude has the fix prompt.
+```
+
+At most three issue lines are shown, then `+N more`. A review with nothing to report
+is one line: `Libra · review of PR #3045 · Confidence 5/5 · no issues found in what Libra ran`.
+A run where Libra produced no review says nothing.
+
+Claude receives the same review as a labeled `<libra>` block: the score, each issue
+with its file and why it matters, the fix prompt Libra wrote for the PR comment, and a
+link to the full report. The block says it is data, and asks Claude to tell you about
+the review and to change nothing until you ask. The review is built by the same code
+that writes the Check Run and the PR comment, so the session and GitHub agree. Exact
+line numbers need the GitHub diff, so the full report has them, not the session.
+
+**Claude raises it before ending its turn.** If a finished review has real issues and
+Claude has not raised it at the end of a turn, Libra's Stop hook asks Claude to tell
+you about the issues and ask whether to fix them, and not to change code until you
+say yes. This happens at most once per review (and never when a Libra Stop hook
+already continued the turn). Clean reviews never do this. Codex gets the review as
+context only: no visible block and no Stop hook.
+
+What the plugin sends for this: the PR numbers it noticed (`watch.prs`) with each
+event batch. A repo with no GitHub remote has no PRs to watch. Each block shown is
+recorded as a `libra_surfaced` note (`pr_watch`, `pr_review`, `pr_review_stop`) with
+the PR number and run id.
+
+## Feedback
+
+`/libra-feedback useful`, `/libra-feedback not useful <why>`, or
+`/libra-feedback wrong <what>` sends a rating and note to the Libra team, tied to the
+last thing Libra showed on this machine. Only an explicit leading word sets a rating:
+`useful`, `helpful`, `+1` for useful; `not useful`, `not helpful`, `unhelpful`,
+`useless`, `noise`, `noisy`, `-1` for not useful; `wrong`, `incorrect`, `inaccurate`,
+`false positive` for wrong. Anything else, including "no, this was actually helpful",
+is sent as a comment with your full text. Notes are redacted like everything else
+before they leave your machine.
 
 ## Tool-only fallback: remote MCP
 
@@ -67,7 +222,10 @@ Only what Libra needs to reason, never raw secrets or full file contents:
 - the repo, branch, and HEAD,
 - sanitized hook metadata, user-prompt summaries, tool names, and command summaries,
 - bounded sanitized transcript summaries when the agent hook exposes a transcript path,
-- bounded sanitized transcript entries only if full transcript capture is explicitly enabled.
+- bounded sanitized transcript entries only if full transcript capture is explicitly enabled,
+- the numbers of the PRs your session works on (`watch.prs`), so Libra can bring its review back,
+- a record of each Libra block shown in the session (`libra_surfaced`) and any feedback you
+  send (`libra_feedback`), so Libra can measure which notes help.
 
 Tokens, env values, keys, and auth headers are redacted before anything leaves your
 machine. Hard caps bound payload size.
@@ -101,22 +259,27 @@ payloads are redacted and capped before storage.
 
 | Libra finding | What happens |
 |---|---|
-| nothing | silent, commit proceeds |
-| low / medium risk | Libra surfaces an advisory note in your session, commit proceeds |
+| nothing, and the analysis completed | one line, `Libra · commit check · nothing flagged against <repo> production history`, commit proceeds |
+| nothing, but the analysis did not complete (repo not linked, model unavailable) | silent, commit proceeds |
+| low / medium risk | one visible Libra block plus a labeled `<libra>` note for Claude, commit proceeds |
 | high / critical risk | Claude Code asks you "Libra flagged X, commit anyway?" before committing |
-| Libra slow or down | commit proceeds (fail-open) |
+| Libra slow or down | silent, commit proceeds (fail-open) |
 
 ## Status
 
 Implemented in this package:
 - Hosted remote MCP endpoint at `https://api.libra.exla.ai/mcp` for on-demand tools.
-- Claude Code hooks for session start, user prompts, tool use, compaction, session end,
+- Claude Code hooks for session start, user prompts, tool use, compaction, stop, session end,
   and commit attempts.
 - Codex hook installer for native Codex session start, user prompt, and stop events.
 - Local redaction, transcript tailing by offset, bounded event batches, and fail-open API
   calls.
-- Advisory commit checks, sanitized session-event viewing, fix-offer listing, and
+- Commit checks, sanitized session-event viewing, fix-offer listing, and
   `/libra` query fallback.
+- Visible Libra blocks in Claude Code (plugin 0.2.0), a record of each line shown, and
+  `/libra-feedback`.
+- Libra's PR review in the live session: a watching line, the finished review for you and
+  Claude, and one Stop reminder per review with issues (Claude Code only).
 
 Still planned:
 - First-class distribution docs and a published install URL.

@@ -28,6 +28,13 @@
         ]
       }
     ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" claude-code", "timeout": 10 }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [
