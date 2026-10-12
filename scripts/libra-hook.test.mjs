@@ -244,9 +244,19 @@ test("SessionStart shows a visible Libra block, the intro once, and records what
     assertContextBlock(compactedOut.hookSpecificOutput.additionalContext, { label: "compaction context" });
     assert.match(compactedOut.hookSpecificOutput.additionalContext, /Open production risks \(2\)/);
 
+    // Same risks in a new session: Claude gets the context, the developer is
+    // not shown the same block again.
     const second = await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionStart", source: "startup", session_id: "sess-b", cwd: repo } });
     const secondOut = JSON.parse(second.stdout);
-    assert.deepEqual(assertVisibleBlock(secondOut.systemMessage, "second session start"), [
+    assert.equal(secondOut.systemMessage, undefined, "an unchanged risk picture is not shown twice in a day");
+    assert.match(secondOut.hookSpecificOutput.additionalContext, /Open production risks \(2\)/);
+
+    // A day later the unchanged picture is shown once more, without the intro.
+    const statePath = path.join(home, ".config/libra/coding-agent/plugin-state.json");
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    fs.writeFileSync(statePath, JSON.stringify({ ...state, lastStatusShownAt: Date.now() - 21 * 60 * 60 * 1000 }));
+    const nextDay = await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionStart", source: "startup", session_id: "sess-c", cwd: repo } });
+    assert.deepEqual(assertVisibleBlock(JSON.parse(nextDay.stdout).systemMessage, "next day session start"), [
       "Libra · acme/app",
       "  - 2 open production risks. Top: Gmail thread reads return 404 (P2, prod)",
       "  - Commits are checked against production before they land.",
@@ -1405,8 +1415,9 @@ test("A review is delivered at SessionStart and UserPromptSubmit too, beside wha
 
   await withApi({ [EVENTS]: () => ({ ok: true, activeRisks: RISKS, inbox: { prs: [reviewedEntry({ runId: "run-start" })] } }) }, async (api) => {
     const start = JSON.parse((await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionStart", source: "resume", session_id: sid, cwd: repo } })).stdout);
-    assert.match(start.systemMessage, /^Libra · acme\/app\n/);
-    assert.match(start.systemMessage, /\nLibra · review of PR #3045 · Confidence 3\/5\n/);
+    // The unchanged risk block was already shown at the earlier start; the new review still is.
+    assert.doesNotMatch(start.systemMessage, /^Libra · acme\/app\n/);
+    assert.match(start.systemMessage, /^Libra · review of PR #3045 · Confidence 3\/5\n/);
     assert.equal(start.hookSpecificOutput.hookEventName, "SessionStart");
     assert.match(start.hookSpecificOutput.additionalContext, /Open production risks[\s\S]*Libra's finished review of PR #3045/);
     assert.equal(start.hookSpecificOutput.additionalContext.split("<libra ").length - 1, 2, "each producer keeps its own labeled block");

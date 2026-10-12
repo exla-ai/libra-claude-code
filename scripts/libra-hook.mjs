@@ -730,11 +730,21 @@ function sessionStartOutput(response, context) {
   let intro = null;
   if (context.visible && context.showStatus && response) {
     intro = context.allowIntro ? introLineOnce() : null;
-    message = visibleBlock(`Libra · ${repoShort}`, [
-      ...bullets,
-      "  - Commits are checked against production before they land.",
-      ...(intro ? [intro] : []),
-    ]);
+    // A developer starts several sessions a day, and the same risk list on
+    // every one turns into wallpaper. Show it when it changed since it was
+    // last shown (or the repo changed), and otherwise at most once a day.
+    // Claude still gets the full context below on every session.
+    const digest = JSON.stringify([context.repo, riskCount, titles.slice(0, 3), count]);
+    const global = readGlobalState();
+    const stale = Date.now() - Number(global.lastStatusShownAt || 0) >= STATUS_REPEAT_MS;
+    if (intro || stale || global.lastStatusDigest !== digest) {
+      patchGlobalState({ lastStatusDigest: digest, lastStatusShownAt: Date.now() });
+      message = visibleBlock(`Libra · ${repoShort}`, [
+        ...bullets,
+        "  - Commits are checked against production before they land.",
+        ...(intro ? [intro] : []),
+      ]);
+    }
   }
   if (message || contextLines.length) {
     recordSurfaced(context, { kind: "session_start", visibleText: message || "", titles, introShown: Boolean(intro) });
@@ -839,6 +849,8 @@ function shortRepo(repo) {
 
 // One-time intro after install or update, so the developer learns what the
 // new lines are and how to answer back. Tracked per plugin version.
+const STATUS_REPEAT_MS = 20 * 60 * 60 * 1000;
+
 function introLineOnce() {
   const global = readGlobalState();
   if (global.introShownVersion === PLUGIN_VERSION) return null;
