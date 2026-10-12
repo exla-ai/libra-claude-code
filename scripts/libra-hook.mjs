@@ -791,9 +791,14 @@ function commitSeverity(value) {
   return ["low", "medium", "high", "critical"].includes(severity) ? severity : null;
 }
 
+// Cut at a word boundary when one is reasonably close, so a shortened line
+// reads "requests terminate..." rather than "requests terminate wit...".
 function truncate(text, max) {
   if (text.length <= max) return text;
-  return `${text.slice(0, Math.max(0, max - 3)).trimEnd()}...`;
+  const cut = text.slice(0, Math.max(0, max - 3));
+  const space = cut.lastIndexOf(" ");
+  const kept = space >= cut.length * 0.6 ? cut.slice(0, space) : cut;
+  return `${kept.replace(/[\s,;:.-]+$/, "")}...`;
 }
 
 function firstSentence(value, max) {
