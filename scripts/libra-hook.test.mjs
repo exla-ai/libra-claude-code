@@ -264,7 +264,7 @@ test("SessionStart shows a visible Libra block, the intro once, and records what
 
     await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUse", session_id: "sess-a", cwd: repo, tool_name: "Read" } });
     const flushed = requests.at(-1).body;
-    assert.equal(flushed.metadata.pluginVersion, "0.3.1");
+    assert.equal(flushed.metadata.pluginVersion, "0.3.2");
     // sess-a showed two session_start notes (startup, then context-only after compaction).
     const surfaced = flushed.events.filter((e) => e.type === "libra_surfaced");
     assert.equal(surfaced.length, 1);
@@ -408,6 +408,24 @@ test("Prompt matches show which production items Libra gave Claude", async () =>
     assert.equal(surfaced[0].payload.visibleText, out.systemMessage);
     assert.equal(surfaced[0].payload.feedbackAsked, true);
     assert.deepEqual(surfaced[0].payload.titles, ["Gmail draft reads use stale IDs", "Fix PR #2063: Notification thread cache diverges"]);
+  });
+});
+
+test("Model-written titles with em or en dashes reach the developer and Claude without them", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const promptMatches = {
+    fixPrs: [],
+    risks: [{ severity: "P3", environment: "prod", status: "watching", title: "Slack Sync Silently Fails to Update Message Cursor \u2014 Affected Channel Loses Sync Progress", summary: "Week of Oct 6\u201312 \u2013 cursor stuck." }],
+  };
+  await withApi({ "/developer-sessions/events": () => ({ ok: true, promptMatches }) }, async (api) => {
+    const run = await runHook({ api, home, cwd: repo, input: { hook_event_name: "UserPromptSubmit", session_id: "sess-dash", cwd: repo, prompt: "why is the slack sync cursor stuck" } });
+    const out = JSON.parse(run.stdout);
+    const lines = assertVisibleBlock(out.systemMessage, "dashed title");
+    assert.match(lines[1], /^ {2}- Slack Sync Silently Fails to Update Message Cursor: Affected Channel/);
+    const ctx = out.hookSpecificOutput.additionalContext;
+    assertContextBlock(ctx, { label: "dashed title context" });
+    assert.match(ctx, /Week of Oct 6-12: cursor stuck\./);
   });
 });
 

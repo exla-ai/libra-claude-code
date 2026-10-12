@@ -11,7 +11,7 @@ const MAX_EVENTS_PER_POST = 40;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "0.3.1";
+const PLUGIN_VERSION = "0.3.2";
 const MAX_PENDING_SURFACED = 10;
 const FEEDBACK_ASK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // Feedback attaches to the last note Libra showed only while that note is recent.
@@ -801,7 +801,7 @@ function cleanField(value, max = MAX_FIELD, { label = false } = {}) {
   if (value == null || typeof value === "object" || typeof value === "function") return "";
   let text = String(value).slice(0, 4_000);
   text = text.replace(ANSI_SEQUENCE_RE, " ").replace(CONTROL_CHAR_RE, " ").replace(INVISIBLE_CHAR_RE, "");
-  text = sanitizeText(text, 4_000).replace(/\s+/g, " ").trim();
+  text = plainDashes(sanitizeText(text, 4_000).replace(/\s+/g, " ").trim());
   text = text.replace(/<\s*(\/?)\s*libra/gi, "($1libra");
   if (label) text = text.replace(/[^A-Za-z0-9 _.:/+-]/g, "").replace(/\s+/g, " ").trim();
   return truncate(text, max);
@@ -848,7 +848,13 @@ function titleLine(prefix, title, suffix = "") {
 }
 
 function visibleBlock(header, lines) {
-  return [header, ...lines].map((line) => truncate(line, MAX_VISIBLE_LINE)).join("\n");
+  return [header, ...lines].map((line) => truncate(plainDashes(line), MAX_VISIBLE_LINE)).join("\n");
+}
+
+// Risk titles are model-written and sometimes carry em or en dashes; Libra's
+// copy never does. "A — B" reads "A: B", and a range "6–12" reads "6-12".
+function plainDashes(text) {
+  return String(text).replace(/\s*[\u2014\u2013]\s+|\s+[\u2014\u2013]\s*/g, ": ").replace(/[\u2014\u2013]/g, "-");
 }
 
 function libraContext(repo, lines, howToUse) {
