@@ -3,7 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const DEFAULT_API = "https://api.libra.exla.ai";
 const MAX_TRANSCRIPT_BYTES_PER_HOOK = 80_000;
@@ -11,8 +12,16 @@ const MAX_EVENTS_PER_POST = 40;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "0.3.3";
+const PLUGIN_VERSION = "0.3.4";
 const MAX_PENDING_SURFACED = 10;
+// Fast updates (see runNewestInstalledCopy): where this copy lives, how often
+// a hook may ask Claude Code to refresh the plugin, and the size cap for
+// reading another installed copy.
+const SCRIPT_PATH = fileURLToPath(import.meta.url);
+const PLUGIN_ROOT = path.resolve(path.dirname(SCRIPT_PATH), "..");
+const SELF_UPDATE_INTERVAL_MS = 15 * 60 * 1000;
+const SELF_UPDATE_COMMAND_MS = 120_000;
+const MAX_SCRIPT_BYTES = 4 * 1024 * 1024;
 const FEEDBACK_ASK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // Feedback attaches to the last note Libra showed only while that note is recent.
 const FEEDBACK_ATTACH_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -126,6 +135,9 @@ setTimeout(() => process.exit(0), WATCH_MODE ? WATCH_MAX_MS + 60_000 : HARD_EXIT
 main().catch(() => process.exit(0));
 
 async function main() {
+  const delegated = runNewestInstalledCopy();
+  if (delegated != null) process.exit(delegated);
+  if (!WATCH_MODE && process.argv[2] !== "feedback") refreshInstallInBackground();
   if (process.argv[2] === "feedback") {
     await runFeedback(process.argv.slice(3));
     return;
@@ -835,6 +847,149 @@ function ago(ms) {
   const hours = Math.round(minutes / 60);
   if (hours < 48) return `${hours}h ago`;
   return `${Math.round(hours / 24)}d ago`;
+}
+
+// Fast updates. Claude Code loads a plugin from its local cache at launch and
+// fetches updates only in the background of a session that has had a message,
+// so a release reached a developer one or two launches late, and a window left
+// open never got it. Two things close that gap:
+//  1. Every hook runs the newest copy of this script installed on the machine
+//     (the marketplace clone or a newer cache version), so an update applies
+//     to open sessions on their next hook, without a restart.
+//  2. While the developer works, a hook asks Claude Code to refresh the
+//     marketplace and update the plugin, at most every 15 minutes, and only
+//     when they turned auto-update on for this marketplace.
+// Only hook scripts change this way; a change to hooks.json still waits for a
+// restart or /reload-plugins. LIBRA_PLUGIN_SELF_UPDATE=0 turns both off.
+
+// Where Claude Code installed this copy: <plugins>/cache/<marketplace>/<plugin>/<version>.
+// A copy that runs elsewhere (a checkout, the Codex install) is left alone.
+function installLayout() {
+  const root = process.env.LIBRA_HOOK_INSTALL_ROOT || PLUGIN_ROOT;
+  const match = root.replace(/\\/g, "/").match(/^(.*\/plugins)\/cache\/([^/]+)\/([^/]+)\/[^/]+\/?$/);
+  if (!match) return null;
+  return { root, pluginsDir: match[1], marketplace: match[2], plugin: match[3] };
+}
+
+function scriptVersion(text) {
+  const match = /const PLUGIN_VERSION = "(\d+)\.(\d+)\.(\d+)";/.exec(text);
+  return match ? match.slice(1).map(Number) : null;
+}
+
+function isNewerVersion(a, b) {
+  for (let i = 0; i < 3; i += 1) if (a[i] !== b[i]) return a[i] > b[i];
+  return false;
+}
+
+function newestInstalledCopy(layout) {
+  const own = scriptVersion(`const PLUGIN_VERSION = "${PLUGIN_VERSION}";`);
+  const versionsDir = path.join(layout.pluginsDir, "cache", layout.marketplace, layout.plugin);
+  const candidates = [path.join(layout.pluginsDir, "marketplaces", layout.marketplace, "scripts", "libra-hook.mjs")];
+  try {
+    for (const entry of fs.readdirSync(versionsDir)) candidates.push(path.join(versionsDir, entry, "scripts", "libra-hook.mjs"));
+  } catch {}
+  let self = SCRIPT_PATH;
+  try { self = fs.realpathSync(SCRIPT_PATH); } catch {}
+  let best = null;
+  for (const file of candidates) {
+    try {
+      const real = fs.realpathSync(file);
+      if (real === self) continue;
+      const stat = fs.statSync(real);
+      if (!stat.isFile() || stat.size > MAX_SCRIPT_BYTES) continue;
+      const version = scriptVersion(fs.readFileSync(real, "utf8"));
+      if (!version || !isNewerVersion(version, best ? best.version : own)) continue;
+      best = { file: real, version, stamp: `${real}:${stat.size}:${stat.mtimeMs}` };
+    } catch {}
+  }
+  return best;
+}
+
+// A copy mid-download or broken must never replace a working hook, so each
+// file is syntax-checked once (remembered by path, size, and mtime).
+function copyParses(best) {
+  const global = readGlobalState();
+  if (global.checkedCopy === best.stamp) return true;
+  const result = spawnSync(process.execPath, ["--check", best.file], { stdio: "ignore", timeout: 3_000 });
+  if (result.status !== 0) return false;
+  patchGlobalState({ checkedCopy: best.stamp });
+  return true;
+}
+
+// Returns the newer copy's exit code, or null to run this one.
+function runNewestInstalledCopy() {
+  if (process.env.LIBRA_HOOK_DELEGATED || process.env.LIBRA_PLUGIN_SELF_UPDATE === "0") return null;
+  const layout = installLayout();
+  if (!layout) return null;
+  let best = null;
+  try {
+    best = newestInstalledCopy(layout);
+    if (!best || !copyParses(best)) return null;
+  } catch {
+    return null;
+  }
+  const result = spawnSync(process.execPath, [best.file, ...process.argv.slice(2)], {
+    stdio: "inherit",
+    env: {
+      ...process.env,
+      LIBRA_HOOK_DELEGATED: "1",
+      LIBRA_HOOK_INSTALL_ROOT: layout.root,
+      CLAUDE_PLUGIN_ROOT: path.resolve(path.dirname(best.file), ".."),
+    },
+    timeout: WATCH_MODE ? WATCH_MAX_MS + 90_000 : HARD_EXIT_MS + 500,
+  });
+  // It never started, so stdin is still unread: run this copy instead.
+  if (result.error && result.error.code === "ENOENT") return null;
+  return typeof result.status === "number" ? result.status : 0;
+}
+
+function marketplaceAutoUpdates(layout) {
+  try {
+    const known = JSON.parse(fs.readFileSync(path.join(layout.pluginsDir, "known_marketplaces.json"), "utf8"));
+    return known?.[layout.marketplace]?.autoUpdate === true;
+  } catch {
+    return false;
+  }
+}
+
+function refreshInstallInBackground() {
+  if (process.env.LIBRA_PLUGIN_SELF_UPDATE === "0") return;
+  const updatesOff = process.env.DISABLE_AUTOUPDATER || process.env.DISABLE_UPDATES || process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC;
+  if (updatesOff && !process.env.FORCE_AUTOUPDATE_PLUGINS) return;
+  const layout = installLayout();
+  if (!layout || !marketplaceAutoUpdates(layout)) return;
+  try {
+    const dir = stateDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const lock = path.join(dir, "plugin-refresh.lock");
+    const now = Date.now();
+    try {
+      if (now - fs.statSync(lock).mtimeMs < SELF_UPDATE_INTERVAL_MS) return;
+      // Only one of several parallel hooks wins this rename.
+      const old = `${lock}.${process.pid}.old`;
+      fs.renameSync(lock, old);
+      fs.rmSync(old, { force: true });
+    } catch (error) {
+      if (error?.code !== "ENOENT") return;
+    }
+    fs.writeFileSync(lock, String(now), { flag: "wx" });
+  } catch {
+    return;
+  }
+  const script = [
+    "const { execFileSync } = require('node:child_process');",
+    `const opts = { stdio: 'ignore', timeout: ${SELF_UPDATE_COMMAND_MS} };`,
+    "try { execFileSync('claude', ['plugin', 'marketplace', 'update', process.argv[1]], opts); execFileSync('claude', ['plugin', 'update', process.argv[2]], opts); } catch {}",
+  ].join(" ");
+  try {
+    const child = spawn(process.execPath, ["-e", script, layout.marketplace, `${layout.plugin}@${layout.marketplace}`], {
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env, LIBRA_HOOK_DELEGATED: "", LIBRA_HOOK_INSTALL_ROOT: "" },
+    });
+    child.on("error", () => {});
+    child.unref();
+  } catch {}
 }
 
 function isRecord(value) {

@@ -279,7 +279,7 @@ test("SessionStart shows the developer only production risks that are new to the
     for (const sessionId of ["sess-a", "sess-c", "sess-e"]) {
       await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUse", session_id: sessionId, cwd: repo, tool_name: "Read" } });
     }
-    assert.equal(requests.at(-1).body.metadata.pluginVersion, "0.3.3");
+    assert.equal(requests.at(-1).body.metadata.pluginVersion, "0.3.4");
     const surfaced = requests.flatMap((r) => r.body.events || []).filter((e) => e.type === "libra_surfaced" && e.payload.kind === "session_start");
     const intro = surfaced.filter((e) => e.payload.introShown);
     assert.equal(intro.length, 1);
@@ -1834,4 +1834,116 @@ test("the watcher never runs on a Claude Code too old for background hooks, or o
       assert.equal(requests.length, before, `${label} version makes no request`);
     }
   });
+});
+
+// A copy of the hook laid out the way Claude Code installs it:
+// <home>/.claude/plugins/cache/libra/libra-claude-code/<version>/scripts/libra-hook.mjs
+function makeInstall({ marketplaceScript, cacheVersions = {}, autoUpdate } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-install-"));
+  const plugins = path.join(home, ".claude", "plugins");
+  const scripts = path.join(plugins, "cache", "libra", "libra-claude-code", "aaa111", "scripts");
+  fs.mkdirSync(scripts, { recursive: true });
+  fs.copyFileSync(HOOK, path.join(scripts, "libra-hook.mjs"));
+  if (marketplaceScript != null) {
+    fs.mkdirSync(path.join(plugins, "marketplaces", "libra", "scripts"), { recursive: true });
+    fs.writeFileSync(path.join(plugins, "marketplaces", "libra", "scripts", "libra-hook.mjs"), marketplaceScript);
+  }
+  for (const [dir, text] of Object.entries(cacheVersions)) {
+    fs.mkdirSync(path.join(plugins, "cache", "libra", "libra-claude-code", dir, "scripts"), { recursive: true });
+    fs.writeFileSync(path.join(plugins, "cache", "libra", "libra-claude-code", dir, "scripts", "libra-hook.mjs"), text);
+  }
+  if (autoUpdate !== undefined) {
+    fs.writeFileSync(path.join(plugins, "known_marketplaces.json"), JSON.stringify({ libra: { source: { source: "github", repo: "exla-ai/libra-claude-code" }, autoUpdate } }));
+  }
+  return { home, hook: path.join(scripts, "libra-hook.mjs") };
+}
+
+// A stand-in for a newer release: reports what it was given and exits 3.
+const newerCopy = (version) => [
+  "import fs from \"node:fs\";",
+  `const PLUGIN_VERSION = "${version}";`,
+  "const stdin = fs.readFileSync(0, \"utf8\");",
+  "process.stdout.write(JSON.stringify({ ran: PLUGIN_VERSION, args: process.argv.slice(2), stdin, delegated: process.env.LIBRA_HOOK_DELEGATED, installRoot: process.env.LIBRA_HOOK_INSTALL_ROOT }));",
+  "process.exit(3);",
+].join("\n");
+
+async function runInstalled({ hook, home, input = { hook_event_name: "SessionStart", session_id: "s" }, args = ["claude-code"], env: extraEnv = {} }) {
+  const env = { ...process.env };
+  for (const key of ["LIBRA_API_TOKEN", "LIBRA_API_URL", "LIBRA_HOOK_DELEGATED", "LIBRA_HOOK_INSTALL_ROOT", "CLAUDE_CODE_SESSION_ID"]) delete env[key];
+  Object.assign(env, { HOME: home, DISABLE_AUTOUPDATER: "", DISABLE_UPDATES: "", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "" }, extraEnv);
+  const child = spawn("node", [hook, ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stdin.end(JSON.stringify(input));
+  const code = await new Promise((resolve) => child.on("exit", resolve));
+  return { code, stdout };
+}
+
+test("An installed hook runs the newest copy on the machine, passing its input and exit code through", async () => {
+  const input = { hook_event_name: "UserPromptSubmit", session_id: "s", prompt: "hello" };
+  const fromMarketplace = makeInstall({ marketplaceScript: newerCopy("9.9.9") });
+  const run = await runInstalled({ ...fromMarketplace, input });
+  assert.equal(run.code, 3, "the newer copy's exit code is the hook's");
+  const out = JSON.parse(run.stdout);
+  assert.equal(out.ran, "9.9.9");
+  assert.deepEqual(out.args, ["claude-code"]);
+  assert.deepEqual(JSON.parse(out.stdin), input, "the hook input reaches the newer copy untouched");
+  assert.equal(out.delegated, "1", "the newer copy is told not to hand off again");
+  assert.match(out.installRoot, /cache\/libra\/libra-claude-code\/aaa111$/);
+
+  // A newer cache version beats the marketplace copy; versions compare as numbers.
+  const both = makeInstall({ marketplaceScript: newerCopy("9.9.9"), cacheVersions: { bbb222: newerCopy("9.10.0") } });
+  assert.equal(JSON.parse((await runInstalled(both)).stdout).ran, "9.10.0");
+
+  // The real hook as the newer copy does its whole job and reports its own version.
+  const realNewer = fs.readFileSync(HOOK, "utf8").replace(/const PLUGIN_VERSION = "[^"]+";/, 'const PLUGIN_VERSION = "9.9.9";');
+  const real = makeInstall({ marketplaceScript: realNewer });
+  const repo = makeRepo();
+  await withApi({ "/developer-sessions/events": () => ({ ok: true, activeRisks: RISKS }) }, async (api, requests) => {
+    const env = { LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test" };
+    const started = await runInstalled({ ...real, env, input: { hook_event_name: "SessionStart", source: "startup", session_id: "sess-real", cwd: repo } });
+    assert.equal(started.code, 0);
+    assert.equal(JSON.parse(started.stdout).systemMessage, "Libra · on for app\n  Libra notes production issues tied to what you work on here. Tell us what helps with /libra-feedback.");
+    assert.equal(requests.at(-1).body.metadata.pluginVersion, "9.9.9", "the newer copy is the one that ran");
+  });
+});
+
+test("A broken, older, or switched-off copy never replaces the running hook", async () => {
+  const cases = [
+    ["broken", { marketplaceScript: `const PLUGIN_VERSION = "9.9.9";\nthis is not javascript (` }, {}],
+    ["older", { marketplaceScript: newerCopy("0.0.1") }, {}],
+    ["switched off", { marketplaceScript: newerCopy("9.9.9") }, { LIBRA_PLUGIN_SELF_UPDATE: "0" }],
+  ];
+  for (const [label, install, env] of cases) {
+    const { hook, home } = makeInstall(install);
+    const run = await runInstalled({ hook, home, env });
+    assert.equal(run.code, 0, label);
+    assert.equal(run.stdout, "", `${label}: this copy ran (no credentials, so it says nothing)`);
+  }
+});
+
+test("With auto-update on, hooks refresh the plugin in the background at most every 15 minutes", async () => {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), "libra-bin-"));
+  const log = path.join(bin, "claude.log");
+  fs.writeFileSync(path.join(bin, "claude"), `#!/bin/sh\necho "$@" >> "${log}"\n`, { mode: 0o755 });
+  const env = { PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+  const lines = () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n") : []);
+  const waitFor = async (n) => { for (let i = 0; i < 60 && lines().length < n; i += 1) await sleep(50); };
+
+  const on = makeInstall({ autoUpdate: true });
+  await runInstalled({ ...on, env });
+  await waitFor(2);
+  assert.deepEqual(lines(), ["plugin marketplace update libra", "plugin update libra-claude-code@libra"]);
+  await runInstalled({ ...on, env });
+  await sleep(500);
+  assert.equal(lines().length, 2, "a second hook inside 15 minutes does not refresh again");
+
+  // /libra-feedback never refreshes, and neither does auto-update off, unset, or disabled.
+  fs.rmSync(log);
+  await runInstalled({ ...makeInstall({ autoUpdate: false }), env });
+  await runInstalled({ ...makeInstall({}), env });
+  await runInstalled({ ...makeInstall({ autoUpdate: true }), env: { ...env, DISABLE_AUTOUPDATER: "1" } });
+  await runInstalled({ ...makeInstall({ autoUpdate: true }), env, args: ["feedback", "useful"] });
+  await sleep(500);
+  assert.deepEqual(lines(), [], "no refresh without an explicit auto-update opt-in");
 });

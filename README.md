@@ -56,15 +56,20 @@ automatic session events are sent.
 
 ## Updating
 
-Third-party marketplaces do not auto-update by default. To pick up a new version:
+Third-party marketplaces do not auto-update by default. Turn it on once in
+`/plugin` (Marketplaces, libra, enable auto-update), or update by hand:
 
 ```bash
 claude plugin marketplace update libra
 claude plugin update libra-claude-code@libra
 ```
 
-Then restart Claude Code. The first session after an update shows a one-time line
-explaining what is new.
+From 0.3.4 on, updates arrive within about 15 minutes. With auto-update on,
+Libra's hook runs those two commands in the background at most every 15 minutes
+while you work. Every hook also runs the newest Libra copy on your machine, so
+open sessions pick up an update on their next action, without a restart. A
+change to which hooks are registered still needs a restart or `/reload-plugins`.
+Set `LIBRA_PLUGIN_SELF_UPDATE=0` to turn this off.
 
 ## What you see in a session
 
