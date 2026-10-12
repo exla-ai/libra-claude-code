@@ -74,24 +74,27 @@ never claims a result it does not have). "Nothing flagged" appears only when the
 server confirms it finished the analysis; a repo Libra cannot see, an analysis that
 did not complete, or a missing answer all stay silent.
 
-**Session start**
+**Session start: only when something is new in production**
 
 ```text
-Libra · CedarCopilot/cedar-mail
-  - 12 open production risks. Top: Agent email and conversation tools are failing for production users (P2, prod)
-  - 1 Libra fix PR to review: /libra-review
-  - Commits are checked against production before they land.
+Libra · new in cedar-mail production
+  - User executions fail before they start because connection tokens are missing (P2, started 3h ago)
+  - 1 fix PR to review: /libra-review
+  Claude has the details.
 ```
 
-Lines that do not apply are left out. The first session after an install or update
-adds one line: `New: Libra now shows these notes here. Tell us what helps with /libra-feedback.`
-It is not repeated after a context compaction.
+A risk appears once, the first session after Libra confirms it in production
+(P1 or P2, first seen in the last 72 hours). It is not shown again on this machine.
+With nothing new, the developer sees nothing; Claude still gets the open production
+risks as context. A change in the fix PRs waiting for review is a one-line note on
+its own. The very first session ever shows `Libra · on for <repo>` with one line
+naming `/libra-feedback`, and `/libra-login` always confirms `Libra · on for <repo>`.
 
 **Your request matches something Libra tracks**
 
 ```text
 Libra · related to this request
-  - Gmail draft reads use stale IDs (P2, prod)
+  - Gmail draft reads use stale IDs (P2, prod, last seen 3h ago)
   - Fix PR #2063: Notification thread cache diverges (unreviewed)
   Claude has the details.
 ```

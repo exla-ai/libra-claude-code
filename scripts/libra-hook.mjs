@@ -11,7 +11,7 @@ const MAX_EVENTS_PER_POST = 40;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "0.3.2";
+const PLUGIN_VERSION = "0.3.3";
 const MAX_PENDING_SURFACED = 10;
 const FEEDBACK_ASK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // Feedback attaches to the last note Libra showed only while that note is recent.
@@ -193,6 +193,7 @@ async function main() {
     agent,
     visible,
     allowIntro: Boolean(startSource || input.transcript_path),
+    heartbeat: !startSource && !input.transcript_path,
     showStatus: startSource !== "compact",
   };
 
@@ -666,7 +667,8 @@ function promptMatchOutput(response, context) {
       const environment = cleanField(risk.environment, 20, { label: true });
       const status = cleanField(risk.status, 30, { label: true });
       const title = cleanField(risk.title, 140);
-      const meta = [severity, environment].filter(Boolean).join(", ");
+      const lastSeen = timestampMs(risk.lastSeenAt);
+      const meta = [severity, environment, lastSeen == null ? "" : `last seen ${ago(Date.now() - lastSeen)}`].filter(Boolean).join(", ");
       bullets.push(titleLine("  - ", title, meta ? ` (${meta})` : ""));
       titles.push(title);
       const tag = [severity || "unrated", environment, status].filter(Boolean).join(" ");
@@ -706,37 +708,31 @@ function promptMatchOutput(response, context) {
   return message ? { systemMessage: message, hookSpecificOutput } : { hookSpecificOutput };
 }
 
-// Session-start context: what Libra is watching in prod right now, plus fix
-// PRs awaiting review. The agent context stays silent when both are empty; the
-// visible block still says Libra is on, so the developer knows it is running.
+// Session start. Claude always gets what Libra is watching. The developer sees
+// a note only when there is news: a production risk that started since they
+// last saw one, or a change in the fix PRs waiting for review. The old note
+// repeated "12 open production risks. Top: ..." every session, the count never
+// moved and the top row was often a staging alert, so it said nothing.
 function sessionStartOutput(response, context) {
   const contextLines = [];
-  const bullets = [];
   const howTo = [];
-  const titles = [];
   const repoShort = shortRepo(context.repo);
+  const repoName = repoShort.split("/").pop() || repoShort;
 
   const risks = response?.activeRisks;
   const riskCount = cleanCount(risks?.count);
-  const top = (Array.isArray(risks?.top) ? risks.top : []).filter(isRecord).slice(0, 3);
+  const top = (Array.isArray(risks?.top) ? risks.top : []).filter(isRecord).slice(0, 3).map(cleanRisk).filter((r) => r.title);
+  const recent = (Array.isArray(risks?.recent) ? risks.recent : []).filter(isRecord).slice(0, 5).map(cleanRisk)
+    .filter((r) => r.title && r.firstSeenMs != null);
   if (riskCount >= 1 && top.length) {
     contextLines.push(riskCount > top.length
       ? `Open production risks (${riskCount}), top ${top.length}:`
       : `Open production risks (${riskCount}):`);
-    const cleaned = top.map((r) => ({
-      severity: cleanField(r.severity, 20, { label: true }),
-      environment: cleanField(r.environment, 20, { label: true }),
-      title: cleanField(r.title, 140),
-    }));
-    cleaned.forEach((r, i) => {
+    top.forEach((r, i) => {
       const tag = [r.severity || "unrated", r.environment].filter(Boolean).join(" ");
       contextLines.push(`${i + 1}. [${tag}] ${r.title}`);
     });
     howTo.push("if the task touches these areas, or the user asks about a prod symptom, check Libra first (libra_query, libra_list_risks, or /libra) because it may already have the trace.");
-    const lead = cleaned[0];
-    const meta = [lead.severity, lead.environment].filter(Boolean).join(", ");
-    bullets.push(titleLine(`  - ${riskCount} open production risk${riskCount === 1 ? "" : "s"}. Top: `, lead.title, meta ? ` (${meta})` : ""));
-    titles.push(...cleaned.map((r) => r.title));
   }
 
   const queue = response?.reviewQueue;
@@ -746,30 +742,53 @@ function sessionStartOutput(response, context) {
     const where = repos.length ? ` in ${repos.join(", ")}` : "";
     contextLines.push(`Fix PRs awaiting review (${count})${where}.`);
     howTo.push("/libra-review triages the fix PRs with Libra's verification evidence.");
-    bullets.push(`  - ${count} Libra fix PR${count === 1 ? "" : "s"} to review: /libra-review`);
   }
 
   let message = null;
   let intro = null;
+  let shown = [];
   if (context.visible && context.showStatus && response) {
-    intro = context.allowIntro ? introLineOnce() : null;
-    // A developer starts several sessions a day, and the same risk list on
-    // every one turns into wallpaper. Show it when it changed since it was
-    // last shown (or the repo changed), and otherwise at most once a day.
-    // Claude still gets the full context below on every session.
-    const digest = JSON.stringify([context.repo, riskCount, titles.slice(0, 3), count]);
+    const now = Date.now();
     const global = readGlobalState();
-    const stale = Date.now() - Number(global.lastStatusShownAt || 0) >= STATUS_REPEAT_MS;
-    if (intro || stale || global.lastStatusDigest !== digest) {
-      patchGlobalState({ lastStatusDigest: digest, lastStatusShownAt: Date.now() });
-      message = visibleBlock(`Libra · ${repoShort}`, [
-        ...bullets,
-        "  - Commits are checked against production before they land.",
-        ...(intro ? [intro] : []),
-      ]);
+    // Remembered by id, not by time: a risk is often confirmed hours after it
+    // was first seen, and it is news when it is confirmed.
+    const seen = isRecord(global.shownRisks) ? global.shownRisks : {};
+    shown = recent.filter((r) => !seen[r.key]);
+    const queueDigest = JSON.stringify([context.repo, count]);
+    const showQueue = count >= 1 && (global.lastQueueDigest !== queueDigest || now - Number(global.lastQueueShownAt || 0) >= STATUS_REPEAT_MS);
+    intro = context.allowIntro ? introLineOnce() : null;
+    const queueLine = `${count} fix PR${count === 1 ? "" : "s"} to review: /libra-review`;
+
+    let header = null;
+    const lines = [];
+    if (shown.length) {
+      header = `Libra · new in ${repoName} production`;
+      const listed = shown.length > MAX_VISIBLE_MATCHES ? shown.slice(0, MAX_VISIBLE_MATCHES - 1) : shown;
+      for (const r of listed) {
+        const meta = [r.severity, `started ${ago(now - r.firstSeenMs)}`].filter(Boolean).join(", ");
+        lines.push(titleLine("  - ", r.title, ` (${meta})`));
+      }
+      if (shown.length > listed.length) lines.push(`  - +${shown.length - listed.length} more`);
+      if (showQueue) lines.push(`  - ${queueLine}`);
+      lines.push("  Claude has the details.");
+    } else if (showQueue) {
+      header = `Libra · ${queueLine}`;
+    } else if (intro || context.heartbeat) {
+      header = `Libra · on for ${repoName}`;
+    }
+    if (header) {
+      if (intro) lines.push(intro);
+      message = visibleBlock(header, lines);
+      patchGlobalState({
+        ...(shown.length ? { shownRisks: rememberShown(seen, shown, now) } : {}),
+        ...(showQueue ? { lastQueueDigest: queueDigest, lastQueueShownAt: now } : {}),
+      });
+    } else {
+      shown = [];
     }
   }
   if (message || contextLines.length) {
+    const titles = message ? shown.map((r) => r.title) : top.map((r) => r.title);
     recordSurfaced(context, { kind: "session_start", visibleText: message || "", titles, introShown: Boolean(intro) });
   }
   const out = {};
@@ -778,6 +797,44 @@ function sessionStartOutput(response, context) {
     out.hookSpecificOutput = { hookEventName: "SessionStart", additionalContext: libraContext(context.repo, contextLines, howTo.join(" ")) };
   }
   return Object.keys(out).length ? out : null;
+}
+
+// Ids shown in the last week, newest 200, so the state file stays small.
+function rememberShown(seen, shown, now) {
+  const kept = Object.entries(seen)
+    .filter(([, at]) => Number.isFinite(Number(at)) && now - Number(at) < SHOWN_RISK_MEMORY_MS)
+    .sort((a, b) => Number(b[1]) - Number(a[1]))
+    .slice(0, 200 - shown.length);
+  return Object.fromEntries([...shown.map((r) => [r.key, now]), ...kept]);
+}
+
+function cleanRisk(r) {
+  const title = cleanField(r.title, 140);
+  return {
+    key: hash(`${cleanField(r.id, 80, { label: true }) || title}`),
+    severity: cleanField(r.severity, 20, { label: true }),
+    environment: cleanField(r.environment, 20, { label: true }),
+    title,
+    firstSeenMs: timestampMs(r.firstSeenAt),
+    lastSeenMs: timestampMs(r.lastSeenAt),
+  };
+}
+
+// The server sends ISO times; older rows are `YYYY-MM-DD HH:MM:SS`, which is UTC.
+function timestampMs(value) {
+  if (typeof value !== "string" || value.length > 40) return null;
+  const text = value.trim().replace(" ", "T");
+  const ms = Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(text) ? text : `${text}Z`);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+// "40m ago", "3h ago", "2d ago".
+function ago(ms) {
+  const minutes = Math.max(1, Math.round(Math.max(0, ms) / 60_000));
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
 }
 
 function isRecord(value) {
@@ -876,15 +933,19 @@ function shortRepo(repo) {
   return cleanField(short, 100) || "this repo";
 }
 
-// One-time intro after install or update, so the developer learns what the
-// new lines are and how to answer back. Tracked per plugin version.
+// The fix-PR line repeats at most once a day when nothing changed.
 const STATUS_REPEAT_MS = 20 * 60 * 60 * 1000;
+// The server sends risks first seen in the last 72 hours; a shown one is
+// remembered well past that.
+const SHOWN_RISK_MEMORY_MS = 7 * 24 * 60 * 60 * 1000;
 
+// One intro per developer, ever: it said "New: ..." again after every update.
+// `introShownVersion` is what earlier versions recorded.
 function introLineOnce() {
   const global = readGlobalState();
-  if (global.introShownVersion === PLUGIN_VERSION) return null;
-  patchGlobalState({ introShownVersion: PLUGIN_VERSION, lastFeedbackAskAt: Date.now() });
-  return "  New: Libra now shows these notes here. Tell us what helps with /libra-feedback.";
+  if (global.introShownAt || global.introShownVersion) return null;
+  patchGlobalState({ introShownAt: Date.now(), lastFeedbackAskAt: Date.now() });
+  return "  Libra notes production issues tied to what you work on here. Tell us what helps with /libra-feedback.";
 }
 
 // At most one feedback ask per day across all sessions, appended to a line the
