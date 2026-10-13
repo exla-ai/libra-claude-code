@@ -262,7 +262,7 @@ test("SessionStart shows the developer only production risks that are new to the
     ]);
     assertContextBlock(out.hookSpecificOutput.additionalContext, { label: "session start context" });
     assert.match(out.hookSpecificOutput.additionalContext, /\nOpen production risks \(2\), top 1:\n1\. \[P2 prod\] Gmail thread reads return 404\n/);
-    assert.match(out.hookSpecificOutput.additionalContext, /How to use this: .*libra_query/);
+    assert.match(out.hookSpecificOutput.additionalContext, /How to use this: .*libra_investigate/);
 
     const compacted = await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionStart", source: "compact", session_id: "sess-a", cwd: repo } });
     const compactedOut = JSON.parse(compacted.stdout);
@@ -300,7 +300,7 @@ test("SessionStart shows the developer only production risks that are new to the
     for (const sessionId of ["sess-a", "sess-c", "sess-e"]) {
       await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUse", session_id: sessionId, cwd: repo, tool_name: "Read" } });
     }
-    assert.equal(requests.at(-1).body.metadata.pluginVersion, "0.5.0");
+    assert.equal(requests.at(-1).body.metadata.pluginVersion, "0.6.0");
     const surfaced = requests.flatMap((r) => r.body.events || []).filter((e) => e.type === "libra_surfaced" && e.payload.kind === "session_start");
     const intro = surfaced.filter((e) => e.payload.introShown);
     assert.equal(intro.length, 1);
@@ -2030,7 +2030,7 @@ test("A tool call records locally and returns at once; a background sender posts
     assert.equal(sent.length, 6, "every tool event reached the server");
     assert.ok(requests.length <= 3, `a burst goes out in a few batches, not one per hook: ${requests.length}`);
     assert.ok(sent.every((e) => /^[0-9a-f]{40}$/.test(e.sourceHead || "") || e.sourceHead === null), "the sender stamps the head it sees");
-    assert.equal(requests[0].body.metadata.pluginVersion, "0.5.0");
+    assert.equal(requests[0].body.metadata.pluginVersion, "0.6.0");
   });
 });
 
@@ -2310,6 +2310,40 @@ test("a successful empty monitor snapshot clears a previously cached risk", asyn
     assert.equal(sub.stdout, "");
     const cached = JSON.parse(fs.readFileSync(path.join(home, ".config/libra/coding-agent", `${sessionHash(sid)}.context.json`), "utf8"));
     assert.deepEqual(cached.riskLines, []);
+  });
+});
+
+test("an investigation Libra runs server-side reaches the session within a minute, once", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-investigate";
+  const id = "inv_" + "c".repeat(20);
+  let status = "running";
+  const answerBlock = { key: "investigations", kind: "investigation", contextHeader: "Libra finished investigations this developer asked for:",
+    howTo: "tell the developer each answer in two or three lines, starting with **Libra:**.",
+    items: [{ id: `investigation:${id}`, once: true, context: ["- Question: Is the Clari feed back?", "  Answer: Yes, since 9:40 AM PDT."], title: "Investigation: Is the Clari feed back?" }] };
+  await withApi({
+    [EVENTS]: () => ({ ok: true }),
+    [MONITOR]: () => ({ ok: true, investigations: [{ id, status }], notes: status === "done" ? [answerBlock] : [] }),
+  }, async (api, requests) => {
+    // The coding agent calls libra_investigate; its result carries the id.
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUse", session_id: sid, cwd: repo, tool_name: "mcp__libra__libra_investigate",
+      tool_response: [{ type: "text", text: `Libra is investigating (investigation id: ${id}). Keep working.` }] } });
+    // News was just checked, so only the pending investigation makes the monitor ask.
+    const statePath = path.join(home, ".config/libra/coding-agent", `${sessionHash(sid)}.monitor-state.json`);
+    fs.writeFileSync(statePath, JSON.stringify({ lastNewsAt: Date.now() }));
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", "still running: nothing to say");
+    const asked = requests.filter((r) => r.url === MONITOR);
+    assert.equal(asked.length, 1);
+    assert.deepEqual(asked[0].body.watch, { investigations: [id] });
+    assert.equal(asked[0].body.risks, false);
+    status = "done";
+    const tick = await runMonitor({ api, home, cwd: repo, sid });
+    assertContextBlock(tick.stdout.trim(), { numbered: false });
+    assert.match(tick.stdout, /Libra finished investigations this developer asked for:\n- Question: Is the Clari feed back\?\nAnswer: Yes, since 9:40 AM PDT\./);
+    const before = requests.filter((r) => r.url === MONITOR).length;
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", "told once, and no longer watched");
+    assert.equal(requests.filter((r) => r.url === MONITOR).length, before, "a finished investigation stops the polling");
   });
 });
 

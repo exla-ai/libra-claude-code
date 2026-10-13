@@ -12,7 +12,7 @@ const MAX_EVENTS_PER_POST = 50;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "0.5.0";
+const PLUGIN_VERSION = "0.6.0";
 const MAX_PENDING_SURFACED = 10;
 // Fast updates (see runNewestInstalledCopy): where this copy lives, how often
 // a hook may ask Claude Code to refresh the plugin, and the size cap for
@@ -364,6 +364,7 @@ function withSourceHead(event, head) {
 // from what session start saved, so neither waits on the network.
 async function localHook(lane, { input, hookEvent, config, agent, cwd, sessionExternalId, visible }) {
   trackWatchedPrsCheaply(input, hookEvent, sessionExternalId, cwd);
+  trackInvestigations(input, hookEvent, sessionExternalId);
   const [event] = buildEvents(input, hookEvent, config, agent, null);
   spoolEvent(sessionExternalId, event);
   const meta = { sessionExternalId, cwd, agent, transcriptPath: input.transcript_path || null };
@@ -786,7 +787,7 @@ function formatCommitContext(repo, items, fixOffers) {
   }
   const offerIds = fixOffers.map((o) => cleanField(o.id, 60, { label: true })).filter(Boolean);
   if (offerIds.length) lines.push(`Fix offers available: ${offerIds.join(", ")} (ask the user before applying any)`);
-  return libraContext(repo, lines, "the commit is not blocked. If a finding applies to what was staged, tell the user and offer to fix it (libra_query has the full evidence). Open fix PRs can be reconciled with /libra-review.");
+  return libraContext(repo, lines, "the commit is not blocked. If a finding applies to what was staged, tell the user and offer to fix it; for the production evidence, call libra_investigate and keep working. Open fix PRs can be reconciled with /libra-review.");
 }
 
 // Relevance-gated injection: the server matched the user's own prompt words
@@ -1665,6 +1666,52 @@ function trackWatchedPrsCheaply(input, hookEvent, sessionExternalId, cwd) {
   trackWatchedPrs(input, hookEvent, sessionExternalId, resolveRepoCached(cwd));
 }
 
+// Investigations this session asked Libra for (the libra_investigate tool).
+// The work runs on Libra's server; while one is pending the monitor asks every
+// minute instead of every ten, so the answer reaches the session promptly.
+const INVESTIGATION_ID_RE = /\binv_[a-f0-9]{20}\b/g;
+const INVESTIGATION_WATCH_MS = 15 * 60_000;
+
+function investigationDir(sessionExternalId) {
+  return path.join(stateDir(), `${hash(sessionExternalId)}.investigations`);
+}
+
+function trackInvestigations(input, hookEvent, sessionExternalId) {
+  try {
+    if (hookEvent !== "PostToolUse") return;
+    if (!/(?:^|__)libra_investigate$/i.test(String(input.tool_name || ""))) return;
+    const text = JSON.stringify(input.tool_response ?? input.toolResponse ?? "").slice(0, 20_000);
+    const ids = [...new Set(text.match(INVESTIGATION_ID_RE) || [])].slice(0, 3);
+    if (!ids.length) return;
+    const dir = investigationDir(sessionExternalId);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    for (const id of ids) writeFileAtomic(path.join(dir, `${id}.json`), JSON.stringify({ id, seenAt: Date.now() }));
+  } catch {}
+}
+
+// Pending investigation ids, newest five; ones older than the watch window are dropped.
+function readInvestigations(sessionExternalId) {
+  const dir = investigationDir(sessionExternalId);
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return []; }
+  const now = Date.now();
+  const found = [];
+  for (const name of names) {
+    const file = path.join(dir, name);
+    const match = /^(inv_[a-f0-9]{20})\.json$/.exec(name);
+    if (!match) continue;
+    let seenAt = 0;
+    try { seenAt = Number(JSON.parse(fs.readFileSync(file, "utf8")).seenAt) || 0; } catch {}
+    if (now - seenAt > INVESTIGATION_WATCH_MS) { unlinkQuiet(file); continue; }
+    found.push({ id: match[1], seenAt });
+  }
+  return found.sort((a, b) => b.seenAt - a.seenAt).slice(0, 5).map((f) => f.id);
+}
+
+function forgetInvestigations(sessionExternalId, ids) {
+  for (const id of ids) unlinkQuiet(path.join(investigationDir(sessionExternalId), `${id}.json`));
+}
+
 function inboxStashPath(sessionExternalId) {
   return path.join(stateDir(), `${hash(sessionExternalId)}.inbox.json`);
 }
@@ -1755,7 +1802,7 @@ function cleanErrorSignatures(list) {
 }
 
 const SUBAGENT_SKIP_RE = /statusline|claude-code-guide/i;
-const SUBAGENT_HOW_TO = "if your task touches one of these areas, or you hit an error that looks like one of them, say so in your result so the main session can check Libra's production evidence (libra_query, libra_list_risks). These are stored observations, not a live health check. Preserve caveats and verify current state before claiming an ongoing failure. Do not change course for them otherwise.";
+const SUBAGENT_HOW_TO = "if your task touches one of these areas, or you hit an error that looks like one of them, say so in your result so the main session can ask Libra to investigate. These are stored observations, not a live health check. Preserve caveats and verify current state before claiming an ongoing failure. Do not change course for them otherwise.";
 
 // A subagent starts with none of the session's context, so it gets the same
 // production picture the main session got at start. Claude only.
@@ -1768,7 +1815,7 @@ function subagentOutput(input, sessionExternalId, agent) {
   return { hookSpecificOutput: { hookEventName: "SubagentStart", additionalContext: libraContext(ctx.repo, ctx.riskLines, SUBAGENT_HOW_TO) } };
 }
 
-const FAILURE_HOW_TO = "this local failure is an error Libra also sees in production. Tell the developer in one line, crediting Libra, because fixing it here may also fix it for production users. Do not assume production has the same cause: libra_query has the production traces.";
+const FAILURE_HOW_TO = "this local failure is an error Libra also sees in production. Tell the developer in one line, crediting Libra, because fixing it here may also fix it for production users. Do not assume production has the same cause; to check production, call libra_investigate and keep working.";
 
 // A failed tool call whose error text is one Libra has seen in production.
 // Matched locally against the signatures saved at session start, so a failure
@@ -1939,7 +1986,8 @@ async function runMonitorTick() {
   try { state = JSON.parse(fs.readFileSync(statePath, "utf8")) || {}; } catch {}
   const lastActive = activityMs(sessionExternalId);
   const newsDue = lastActive != null && now - lastActive < MONITOR_ACTIVE_MS && now - Number(state.lastNewsAt || 0) >= MONITOR_NEWS_INTERVAL_MS;
-  if (!watched.length && !newsDue) return;
+  const investigations = readInvestigations(sessionExternalId);
+  if (!watched.length && !newsDue && !investigations.length) return;
   const repoInfo = resolveRepoCached(cwd);
   if (repoInfo.source === "local") return;
   // Stamped before the request, so a server that is down is asked again in ten minutes, not every minute.
@@ -1953,9 +2001,19 @@ async function runMonitorTick() {
     client: "claude-code",
     pluginVersion: PLUGIN_VERSION,
     risks: newsDue,
-    ...(watched.length ? { watch: { prs: watched } } : {}),
+    ...(watched.length || investigations.length ? { watch: {
+      ...(watched.length ? { prs: watched } : {}),
+      ...(investigations.length ? { investigations } : {}),
+    } } : {}),
   }, MONITOR_REQUEST_MS).catch(() => null);
   if (!response) return;
+  // A finished investigation's answer is in this response's notes; stop
+  // asking for it. A server that does not know the id stops it too.
+  if (investigations.length && Array.isArray(response.investigations)) {
+    const pending = new Set(response.investigations
+      .filter((i) => isRecord(i) && (i.status === "queued" || i.status === "running")).map((i) => i.id));
+    forgetInvestigations(sessionExternalId, investigations.filter((id) => !pending.has(id)));
+  }
 
   const context = { sessionExternalId, repo: repoInfo.repo, agent: "claude-code", visible: true };
   // Notes are an answer, even when empty; no notes means the read failed and
@@ -1964,7 +2022,7 @@ async function runMonitorTick() {
   const notes = [];
   const review = wakeMessage(parseInbox(response), context, { kind: "pr_review_monitor", idle: false });
   if (review) notes.push(review);
-  if (newsDue) {
+  if (newsDue || investigations.length) {
     const news = monitorNewsMessage(response, context);
     if (news) notes.push(news);
   }

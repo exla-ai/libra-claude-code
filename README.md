@@ -127,6 +127,17 @@ How to release:
 5. At most one release a day, unless it fixes something broken on a developer's
    machine. Batch the rest.
 
+## Investigations run on Libra's server
+
+From 0.6.0, a question that needs digging ("is it still happening", "who is
+affected", "did this deploy cause it") goes to `libra_investigate`. It returns an
+id at once, so the session keeps working; Libra investigates on its own server
+with its read tools, and the answer arrives in the session as a Libra note. While
+an investigation is pending the monitor checks every minute instead of every ten.
+`/libra`, the `libra-ops` skill and every Libra note steer Claude to it rather than
+chaining Libra reads in the developer's thread. `libra_investigation <id>` fetches
+an answer directly.
+
 ## Speed: only answering hooks wait
 
 Only the hooks whose answer depends on Libra wait for the network: session start,
