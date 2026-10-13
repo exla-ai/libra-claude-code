@@ -12,7 +12,7 @@ const MAX_EVENTS_PER_POST = 50;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "0.4.0";
+const PLUGIN_VERSION = "0.5.0";
 const MAX_PENDING_SURFACED = 10;
 // Fast updates (see runNewestInstalledCopy): where this copy lives, how often
 // a hook may ask Claude Code to refresh the plugin, and the size cap for
@@ -62,6 +62,7 @@ const TRANSCRIPT_LOCK_STALE_MS = 10_000;
 // minutes, for news while the developer is active (a prompt in the last two
 // hours). Windows left open for days stay silent and cost no requests.
 const MONITOR_NEWS_INTERVAL_MS = Number(process.env.LIBRA_HOOK_MONITOR_NEWS_MS) || 10 * 60_000;
+const SESSION_CONTEXT_MAX_AGE_MS = 10 * 60_000;
 const MONITOR_ACTIVE_MS = 2 * 60 * 60_000;
 const MONITOR_REQUEST_MS = 8_000;
 // A monitor this recently alive covers PR reviews, so the Stop watcher stands down.
@@ -793,62 +794,15 @@ function formatCommitContext(repo, items, fixOffers) {
 // on no match; when it fires, the coding agent starts the turn already
 // knowing Libra holds something directly relevant.
 function promptMatchOutput(response, context) {
-  const matches = response?.promptMatches;
-  if (!isRecord(matches)) return null;
-  const risks = (Array.isArray(matches.risks) ? matches.risks : []).filter(isRecord).slice(0, 3);
-  const fixPrs = (Array.isArray(matches.fixPrs) ? matches.fixPrs : []).filter(isRecord).slice(0, 2);
-  if (!risks.length && !fixPrs.length) return null;
-
-  // Visible bullets and the matching titles recorded for measurement: risks
-  // first, then fix PRs.
-  const bullets = [];
-  const titles = [];
-  const contextLines = [];
-  if (risks.length) {
-    contextLines.push(`Production risks Libra is already tracking (${risks.length}):`);
-    risks.forEach((risk, i) => {
-      const severity = cleanField(risk.severity, 20, { label: true });
-      const environment = cleanField(risk.environment, 20, { label: true });
-      const status = cleanField(risk.status, 30, { label: true });
-      const title = cleanField(risk.title, 140);
-      const lastSeen = timestampMs(risk.lastSeenAt);
-      const meta = [severity, environment, lastSeen == null ? "" : `last seen ${ago(Date.now() - lastSeen)}`].filter(Boolean).join(", ");
-      bullets.push(titleLine("  - ", title, meta ? ` (${meta})` : ""));
-      titles.push(title);
-      const tag = [severity || "unrated", environment, status].filter(Boolean).join(" ");
-      const summary = cleanField(risk.summary, 160);
-      contextLines.push(`${i + 1}. [${tag}] ${title}${summary ? `: ${summary}` : ""}`);
-    });
+  const blocks = cleanNoteBlocks(response?.notes);
+  if (!blocks?.length) return null;
+  const rendered = renderNotes(blocks, { surface: "prompt", visible: context.visible });
+  if (!rendered.contextLines.length && !rendered.message) return null;
+  const message = rendered.message && rendered.feedbackAsk ? withFeedbackAsk(rendered.message) : rendered.message;
+  for (const note of rendered.surfaced) {
+    recordSurfaced(context, { ...note, visibleText: message || "", feedbackAsked: Boolean(message && message !== rendered.message) });
   }
-  if (fixPrs.length) {
-    contextLines.push(`Open Libra fix PRs related to this request (${fixPrs.length}):`);
-    fixPrs.forEach((pr, i) => {
-      const number = cleanPrNumber(pr.prNumber);
-      const title = cleanField(pr.title, 120);
-      const reviewed = pr.reviewed === true;
-      bullets.push(titleLine(`  - ${number ? `Fix PR #${number}` : "Fix PR"}: `, title, reviewed ? "" : " (unreviewed)"));
-      titles.push(`${number ? `Fix PR #${number}` : "Fix PR"}: ${title}`);
-      const ci = cleanField(pr.ciRollup, 40, { label: true });
-      const state = [ci ? `own CI ${ci}` : "", reviewed ? "" : "unreviewed"].filter(Boolean).join(", ");
-      contextLines.push(`${i + 1}. ${number ? `#${number} ` : ""}${title}${state ? ` (${state})` : ""}`);
-    });
-  }
-
-  const shown = bullets.length > MAX_VISIBLE_MATCHES ? bullets.slice(0, MAX_VISIBLE_MATCHES - 1) : bullets;
-  if (bullets.length > shown.length) shown.push(`  - +${bullets.length - shown.length} more`);
-  const visibleText = visibleBlock("Libra · related to this request", [...shown, "  Claude has the details."]);
-  const message = context.visible ? withFeedbackAsk(visibleText) : null;
-  recordSurfaced(context, {
-    kind: "prompt_match",
-    visibleText: message || "",
-    titles,
-    feedbackAsked: Boolean(message && message !== visibleText),
-  });
-  const howTo = [
-    risks.length ? "these match the user's request, so check Libra before re-deriving anything (libra_query for the full trace, or /libra)." : "",
-    fixPrs.length ? "For a fix PR, libra_pr_evidence has the evidence and /libra-review <number> triages it." : "",
-  ].filter(Boolean).join(" ");
-  const hookSpecificOutput = { hookEventName: "UserPromptSubmit", additionalContext: libraContext(context.repo, contextLines, howTo) };
+  const hookSpecificOutput = { hookEventName: "UserPromptSubmit", additionalContext: libraContext(context.repo, rendered.contextLines, rendered.howTo) };
   return message ? { systemMessage: message, hookSpecificOutput } : { hookSpecificOutput };
 }
 
@@ -858,83 +812,30 @@ function promptMatchOutput(response, context) {
 // repeated "12 open production risks. Top: ..." every session, the count never
 // moved and the top row was often a staging alert, so it said nothing.
 function sessionStartOutput(response, context) {
-  const contextLines = [];
-  const howTo = [];
-  const repoShort = shortRepo(context.repo);
-  const repoName = repoShort.split("/").pop() || repoShort;
+  const repoName = shortRepo(context.repo).split("/").pop() || shortRepo(context.repo);
+  const blocks = cleanNoteBlocks(response?.notes) || [];
+  const showing = Boolean(context.visible && context.showStatus && response);
+  const rendered = renderNotes(blocks, { surface: "session_start", visible: showing });
 
-  const risks = response?.activeRisks;
-  const top = (Array.isArray(risks?.top) ? risks.top : []).filter(isRecord).slice(0, 3).map(cleanRisk).filter((r) => r.title);
-  const recent = (Array.isArray(risks?.recent) ? risks.recent : []).filter(isRecord).slice(0, 5).map(cleanRisk)
-    .filter((r) => r.title && r.firstSeenMs != null);
-  const riskLines = riskContextLines(risks);
-  if (riskLines.length) {
-    contextLines.push(...riskLines);
-    howTo.push("if the task touches these areas, or the user asks about a prod symptom, check Libra first (libra_query, libra_list_risks, or /libra) because it may already have the trace.");
-  }
-
-  const queue = response?.reviewQueue;
-  const count = cleanCount(queue?.unreviewed);
-  if (count >= 1) {
-    const repos = (Array.isArray(queue.repos) ? queue.repos : []).map((repo) => cleanField(repo, 80)).filter(Boolean).slice(0, 3);
-    const where = repos.length ? ` in ${repos.join(", ")}` : "";
-    contextLines.push(`Fix PRs awaiting review (${count})${where}.`);
-    howTo.push("/libra-review triages the fix PRs with Libra's verification evidence.");
-  }
-
-  let message = null;
+  let message = rendered.message;
   let intro = null;
-  let shown = [];
-  if (context.visible && context.showStatus && response) {
-    const now = Date.now();
-    const global = readGlobalState();
-    // Remembered by id, not by time: a risk is often confirmed hours after it
-    // was first seen, and it is news when it is confirmed.
-    const seen = isRecord(global.shownRisks) ? global.shownRisks : {};
-    // Claimed like the monitor's news, so a session start and the monitor's
-    // first tick, which run at the same moment, never both announce one risk.
-    shown = recent.filter((r) => !seen[r.key]).filter((r) => claimDelivery(`risk|${r.key}`));
-    const queueDigest = JSON.stringify([context.repo, count]);
-    const showQueue = count >= 1 && (global.lastQueueDigest !== queueDigest || now - Number(global.lastQueueShownAt || 0) >= STATUS_REPEAT_MS);
+  if (showing) {
     intro = context.allowIntro ? introLineOnce() : null;
-    const queueLine = `${count} fix PR${count === 1 ? "" : "s"} to review: /libra-review`;
-
-    let header = null;
-    const lines = [];
-    if (shown.length) {
-      header = `Libra · new in ${repoName} production`;
-      const listed = shown.length > MAX_VISIBLE_MATCHES ? shown.slice(0, MAX_VISIBLE_MATCHES - 1) : shown;
-      for (const r of listed) {
-        const meta = [r.severity, `started ${ago(now - r.firstSeenMs)}`].filter(Boolean).join(", ");
-        lines.push(titleLine("  - ", r.title, ` (${meta})`));
-      }
-      if (shown.length > listed.length) lines.push(`  - +${shown.length - listed.length} more`);
-      if (showQueue) lines.push(`  - ${queueLine}`);
-      lines.push("  Claude has the details.");
-    } else if (showQueue) {
-      header = `Libra · ${queueLine}`;
-    } else if (intro || context.heartbeat) {
-      header = `Libra · on for ${repoName}`;
-    }
-    if (header) {
-      if (intro) lines.push(intro);
-      message = visibleBlock(header, lines);
-      patchGlobalState({
-        ...(shown.length ? { shownRisks: rememberShown(seen, shown, now) } : {}),
-        ...(showQueue ? { lastQueueDigest: queueDigest, lastQueueShownAt: now } : {}),
-      });
-    } else {
-      shown = [];
-    }
+    if (message && intro) message = `${message}\n${intro}`;
+    else if (!message && (intro || context.heartbeat)) message = visibleBlock(`Libra · on for ${repoName}`, intro ? [intro] : []);
   }
-  if (message || contextLines.length) {
-    const titles = message ? shown.map((r) => r.title) : top.map((r) => r.title);
-    recordSurfaced(context, { kind: "session_start", visibleText: message || "", titles, introShown: Boolean(intro) });
+  // Every note records the whole message the developer saw. An intro or a
+  // heartbeat with no note of its own is recorded on the first note, or alone.
+  const notes = rendered.surfaced;
+  if (message && !rendered.message && notes.length) notes[0] = { ...notes[0], visibleText: "shown" };
+  for (const note of notes) {
+    recordSurfaced(context, { ...note, visibleText: note.visibleText ? message : "", introShown: Boolean(intro) });
   }
+  if (!notes.length && message) recordSurfaced(context, { kind: "session_start", visibleText: message, titles: [], introShown: Boolean(intro) });
   const out = {};
   if (message) out.systemMessage = message;
-  if (contextLines.length) {
-    out.hookSpecificOutput = { hookEventName: "SessionStart", additionalContext: libraContext(context.repo, contextLines, howTo.join(" ")) };
+  if (rendered.contextLines.length) {
+    out.hookSpecificOutput = { hookEventName: "SessionStart", additionalContext: libraContext(context.repo, rendered.contextLines, rendered.howTo) };
   }
   return Object.keys(out).length ? out : null;
 }
@@ -948,17 +849,171 @@ function rememberShown(seen, shown, now) {
   return Object.fromEntries([...shown.map((r) => [r.key, now]), ...kept]);
 }
 
-function cleanRisk(r) {
-  const title = cleanField(r.title, 140);
+// ---------------------------------------------------------------------------
+// Libra's notes. The server writes every one: what the developer sees, what
+// Claude is told, and which items are told only once
+// (api/src/services/coding-agent-notes.ts). This renders them and nothing
+// more, so a rule or a sentence changes with a server deploy, never a plugin
+// release. What stays here: telling an item once per machine, layout, length
+// caps, and the data-not-instructions envelope around everything.
+
+const MAX_NOTE_BLOCKS = 6;
+const MAX_NOTE_ITEMS = 10;
+const MAX_NOTE_CONTEXT_LINES = 24;
+const MAX_NOTE_CONTEXT_CHARS = 1_000;
+const MAX_CACHED_CONTEXT_LINES = 6;
+const MAX_NOTE_REPEAT_MS = 7 * 24 * 60 * 60 * 1000;
+
+function noteLines(list) {
+  return (Array.isArray(list) ? list : []).filter((line) => typeof line === "string").slice(0, MAX_NOTE_CONTEXT_LINES)
+    .map((line) => cleanField(line, MAX_NOTE_CONTEXT_CHARS)).filter(Boolean);
+}
+
+function noteIds(list, max = 300) {
+  return (Array.isArray(list) ? list : []).map((id) => cleanField(id, max, { label: true })).filter(Boolean).slice(0, 5);
+}
+
+function cleanNoteItem(item) {
+  const repeat = Number(item.repeatAfterMs);
   return {
-    key: hash(`${cleanField(r.id, 80, { label: true }) || title}`),
-    severity: cleanField(r.severity, 20, { label: true }),
-    environment: cleanField(r.environment, 20, { label: true }),
-    title,
-    firstSeenMs: timestampMs(r.firstSeenAt),
-    lastSeenMs: timestampMs(r.lastSeenAt),
+    id: cleanField(item.id, 300, { label: true }),
+    once: item.once === true,
+    repeatAfterMs: Number.isFinite(repeat) && repeat > 0 ? Math.min(repeat, MAX_NOTE_REPEAT_MS) : null,
+    requires: noteIds(item.requires),
+    // Cleaned exactly as earlier versions cleaned the risk ids they remembered.
+    legacyRiskIds: noteIds(item.legacyRiskIds, 80),
+    requiresLegacyRiskIds: noteIds(item.requiresLegacyRiskIds, 80),
+    line: cleanField(item.line, MAX_VISIBLE_LINE - 4),
+    context: noteLines(item.context),
+    title: cleanField(item.title, 200),
   };
 }
+
+// Missing or malformed notes are "nothing to say"; a non-array is "the server
+// did not answer", which keeps the cached context.
+function cleanNoteBlocks(notes) {
+  if (!Array.isArray(notes)) return null;
+  return notes.filter(isRecord).slice(0, MAX_NOTE_BLOCKS).map((block) => ({
+    kind: cleanField(block.kind, 40, { label: true }) || "note",
+    header: cleanField(block.header, MAX_VISIBLE_LINE),
+    footer: cleanField(block.footer, MAX_VISIBLE_LINE),
+    maxVisible: Math.min(Math.max(cleanCount(block.maxVisible) || MAX_VISIBLE_MATCHES, 1), 5),
+    contextHeader: cleanField(block.contextHeader, MAX_NOTE_CONTEXT_CHARS),
+    context: noteLines(block.context),
+    howTo: cleanField(block.howTo, MAX_NOTE_CONTEXT_CHARS),
+    cache: block.cache === true,
+    expiresAt: timestampMs(block.expiresAt),
+    titles: (Array.isArray(block.titles) ? block.titles : []).map((t) => cleanField(t, 160)).filter(Boolean).slice(0, 3),
+    feedbackAsk: block.feedbackAsk === true,
+    joinedLine: cleanField(block.joinedLine, MAX_VISIBLE_LINE - 4),
+    items: (Array.isArray(block.items) ? block.items : []).filter(isRecord).slice(0, MAX_NOTE_ITEMS).map(cleanNoteItem),
+  }));
+}
+
+// When this machine last showed an item: by its id, or by the risk id an
+// earlier version remembered for it.
+function noteShownAt(global, item) {
+  const notes = isRecord(global.shownNotes) ? global.shownNotes : {};
+  const risks = isRecord(global.shownRisks) ? global.shownRisks : {};
+  const times = [notes[hash(item.id)], ...item.legacyRiskIds.map((id) => risks[hash(id)])].map(Number).filter((at) => Number.isFinite(at) && at > 0);
+  return times.length ? Math.max(...times) : null;
+}
+
+function noteRequirementMet(global, item) {
+  if (!item.requires.length && !item.requiresLegacyRiskIds.length) return true;
+  const notes = isRecord(global.shownNotes) ? global.shownNotes : {};
+  const risks = isRecord(global.shownRisks) ? global.shownRisks : {};
+  return item.requires.some((id) => notes[hash(id)]) || item.requiresLegacyRiskIds.some((id) => risks[hash(id)]);
+}
+
+// The items to tell now. Every item without `once` shows; a `once` item shows
+// if this machine has not shown it (or not within repeatAfterMs) and any item
+// it requires was shown here. The claim keeps a session start and the
+// monitor, which run at the same moment, from both telling it.
+function freshNoteItems(block, global, now) {
+  return block.items.filter((item) => {
+    if (!item.once) return true;
+    if (!item.id) return false;
+    const shownAt = noteShownAt(global, item);
+    if (shownAt != null && (item.repeatAfterMs == null || now - shownAt < item.repeatAfterMs)) return false;
+    if (!noteRequirementMet(global, item)) return false;
+    return claimDelivery(`note|${item.id}|${shownAt ?? 0}`);
+  });
+}
+
+// surface "session_start": every block reaches Claude; one with nothing to
+// tell still gives its context. "monitor": only blocks with something new.
+// "prompt": everything, every time. `visible` is whether the developer can be
+// shown anything now; when false, `once` items are left for later.
+function renderNotes(blocks, { surface, visible }) {
+  const now = Date.now();
+  const global = readGlobalState();
+  const contextLines = [];
+  const howTo = [];
+  const parts = [];
+  const surfaced = [];
+  const shownIds = [];
+  let feedbackAsk = false;
+  for (const block of blocks) {
+    const fresh = visible || surface === "monitor" ? freshNoteItems(block, global, now) : block.items.filter((item) => !item.once);
+    const contextOnly = !block.items.length;
+    if (!fresh.length && !(surface === "session_start" && block.context.length)) continue;
+    const itemLines = fresh.flatMap((item) => item.context);
+    const lines = [...block.context, ...itemLines];
+    if (lines.length) {
+      if (block.contextHeader) contextLines.push(block.contextHeader);
+      contextLines.push(...lines);
+      if (block.howTo && !howTo.includes(block.howTo)) howTo.push(block.howTo);
+    }
+    const shown = fresh.filter((item) => item.line);
+    let isVisible = false;
+    if (visible && block.header && fresh.length) {
+      const listed = shown.length > block.maxVisible ? shown.slice(0, block.maxVisible - 1) : shown;
+      const bullets = listed.map((item) => `  - ${item.line}`);
+      if (shown.length > listed.length) bullets.push(`  - +${shown.length - listed.length} more`);
+      parts.push({ header: block.header, bullets, footer: block.footer && shown.length ? block.footer : "", joinedLine: block.joinedLine });
+      isVisible = true;
+      if (block.feedbackAsk) feedbackAsk = true;
+    }
+    for (const item of fresh) if (item.once && item.id) shownIds.push(item.id);
+    const titles = fresh.length ? fresh.map((item) => item.title).filter(Boolean) : contextOnly ? block.titles : [];
+    if (isVisible || surface === "monitor" || (surface === "prompt" && fresh.length) || (surface === "session_start" && contextOnly && titles.length)) {
+      surfaced.push({
+        kind: block.kind,
+        visibleText: surface === "monitor" ? `${block.header || "Libra"}: ${titles.join("; ")}` : isVisible ? "shown" : "",
+        titles,
+        noteIds: fresh.map((item) => item.id).filter(Boolean),
+      });
+    }
+  }
+  if (shownIds.length) {
+    const seen = isRecord(global.shownNotes) ? global.shownNotes : {};
+    patchGlobalState({ shownNotes: rememberShown(seen, shownIds.map((id) => ({ key: hash(id) })), now) });
+  }
+  return { message: composeVisible(parts), contextLines, howTo: howTo.join(" "), surfaced, feedbackAsk };
+}
+
+// One message. A later block with a joinedLine becomes a bullet in the first
+// block ("2 fix PRs to review" under the news); any other gets its own header.
+function composeVisible(parts) {
+  if (!parts.length) return null;
+  const [first, ...rest] = parts;
+  const bullets = [...first.bullets];
+  const separate = [];
+  for (const part of rest) {
+    if (part.joinedLine && first.bullets.length) bullets.push(`  - ${part.joinedLine}`);
+    else separate.push(visibleBlock(part.header, [...part.bullets, ...(part.footer ? [`  ${part.footer}`] : [])]));
+  }
+  const firstBlock = visibleBlock(first.header, [...bullets, ...(first.footer ? [`  ${first.footer}`] : [])]);
+  return [firstBlock, ...separate].join("\n");
+}
+
+
+
+
+
+
+
 
 // The server sends ISO times; older rows are `YYYY-MM-DD HH:MM:SS`, which is UTC.
 function timestampMs(value) {
@@ -1216,8 +1271,6 @@ function shortRepo(repo) {
   return cleanField(short, 100) || "this repo";
 }
 
-// The fix-PR line repeats at most once a day when nothing changed.
-const STATUS_REPEAT_MS = 20 * 60 * 60 * 1000;
 // The server sends risks first seen in the last 72 hours; a shown one is
 // remembered well past that.
 const SHOWN_RISK_MEMORY_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1644,15 +1697,19 @@ function sessionContextPath(sessionExternalId) {
 }
 
 function writeSessionContext(sessionExternalId, repo, response) {
-  const risks = response?.activeRisks;
-  const top = (Array.isArray(risks?.top) ? risks.top : []).filter(isRecord).slice(0, 3).map(cleanRisk).filter((r) => r.title);
+  const blocks = cleanNoteBlocks(response?.notes) || [];
+  const cached = blocks.filter((b) => b.cache);
+  const riskLines = cached.flatMap((b) => b.context).slice(0, MAX_CACHED_CONTEXT_LINES);
+  const expiresAt = Math.min(Date.now() + SESSION_CONTEXT_MAX_AGE_MS, ...cached.map((b) => b.expiresAt).filter((ms) => ms != null));
   try {
     fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
     writeFileAtomic(sessionContextPath(sessionExternalId), JSON.stringify({
       at: Date.now(),
+      expiresAt,
+      riskContract: 2,
       repo,
-      riskLines: riskContextLines(risks),
-      riskTitles: top.map((r) => r.title),
+      riskLines,
+      riskTitles: cached.flatMap((b) => b.titles).slice(0, 3),
       errorSignatures: cleanErrorSignatures(response?.errorSignatures),
     }));
   } catch {}
@@ -1661,11 +1718,17 @@ function writeSessionContext(sessionExternalId, repo, response) {
 function readSessionContext(sessionExternalId) {
   try {
     const ctx = JSON.parse(fs.readFileSync(sessionContextPath(sessionExternalId), "utf8"));
-    if (!isRecord(ctx)) return null;
+    // Contract 2 holds the server's own register lines; anything older was
+    // written from risk rows by an earlier version and is not reused.
+    if (!isRecord(ctx) || ctx.riskContract !== 2) return null;
+    const at = Number(ctx.at);
+    const expiresAt = Number(ctx.expiresAt);
+    if (!Number.isFinite(at) || at > Date.now() || Date.now() - at >= SESSION_CONTEXT_MAX_AGE_MS
+      || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) return null;
     const strings = (list, max, n) => (Array.isArray(list) ? list : []).filter((v) => typeof v === "string").slice(0, n).map((v) => truncate(v, max));
     return {
       repo: String(ctx.repo || ""),
-      riskLines: strings(ctx.riskLines, 220, 4),
+      riskLines: strings(ctx.riskLines, MAX_NOTE_CONTEXT_CHARS, MAX_CACHED_CONTEXT_LINES),
       riskTitles: strings(ctx.riskTitles, 160, 3),
       errorSignatures: cleanErrorSignatures(ctx.errorSignatures),
     };
@@ -1674,17 +1737,9 @@ function readSessionContext(sessionExternalId) {
   }
 }
 
-function riskContextLines(risks) {
-  const riskCount = cleanCount(risks?.count);
-  const top = (Array.isArray(risks?.top) ? risks.top : []).filter(isRecord).slice(0, 3).map(cleanRisk).filter((r) => r.title);
-  if (riskCount < 1 || !top.length) return [];
-  const lines = [riskCount > top.length ? `Open production risks (${riskCount}), top ${top.length}:` : `Open production risks (${riskCount}):`];
-  top.forEach((r, i) => {
-    const tag = [r.severity || "unrated", r.environment].filter(Boolean).join(" ");
-    lines.push(`${i + 1}. [${tag}] ${r.title}`);
-  });
-  return lines;
-}
+// Caveats ride along in every subagent's and failed tool's context, so they
+// are capped here; libra_list_risks has them in full.
+
 
 function cleanErrorSignatures(list) {
   if (!Array.isArray(list)) return [];
@@ -1700,7 +1755,7 @@ function cleanErrorSignatures(list) {
 }
 
 const SUBAGENT_SKIP_RE = /statusline|claude-code-guide/i;
-const SUBAGENT_HOW_TO = "if your task touches one of these areas, or you hit an error that looks like one of them, say so in your result so the main session can check Libra's production evidence (libra_query, libra_list_risks). Do not change course for them otherwise.";
+const SUBAGENT_HOW_TO = "if your task touches one of these areas, or you hit an error that looks like one of them, say so in your result so the main session can check Libra's production evidence (libra_query, libra_list_risks). These are stored observations, not a live health check. Preserve caveats and verify current state before claiming an ongoing failure. Do not change course for them otherwise.";
 
 // A subagent starts with none of the session's context, so it gets the same
 // production picture the main session got at start. Claude only.
@@ -1903,7 +1958,9 @@ async function runMonitorTick() {
   if (!response) return;
 
   const context = { sessionExternalId, repo: repoInfo.repo, agent: "claude-code", visible: true };
-  if (newsDue && (response.activeRisks || response.errorSignatures)) writeSessionContext(sessionExternalId, repoInfo.repo, response);
+  // Notes are an answer, even when empty; no notes means the read failed and
+  // the cached context stays.
+  if (newsDue && Array.isArray(response.notes)) writeSessionContext(sessionExternalId, repoInfo.repo, response);
   const notes = [];
   const review = wakeMessage(parseInbox(response), context, { kind: "pr_review_monitor", idle: false });
   if (review) notes.push(review);
@@ -1918,22 +1975,12 @@ async function runMonitorTick() {
 // Production risks that became news since the developer last heard from
 // Libra, each told once on this machine, in whichever session asks first.
 function monitorNewsMessage(response, context) {
-  const recent = (Array.isArray(response?.activeRisks?.recent) ? response.activeRisks.recent : []).filter(isRecord).slice(0, 5).map(cleanRisk)
-    .filter((r) => r.title && r.firstSeenMs != null);
-  if (!recent.length) return null;
-  const now = Date.now();
-  const global = readGlobalState();
-  const seen = isRecord(global.shownRisks) ? global.shownRisks : {};
-  const fresh = recent.filter((r) => !seen[r.key]).filter((r) => claimDelivery(`risk|${r.key}`));
-  if (!fresh.length) return null;
-  patchGlobalState({ shownRisks: rememberShown(seen, fresh, now) });
-  const lines = ["New production risks Libra confirmed while you were working:"];
-  fresh.forEach((r, i) => {
-    const tag = [r.severity, r.environment].filter(Boolean).join(" ");
-    lines.push(`${i + 1}. [${tag}] ${r.title} (started ${ago(now - r.firstSeenMs)})`);
-  });
-  recordSurfaced(context, { kind: "monitor_news", visibleText: `New in production: ${fresh.map((r) => r.title).join("; ")}`, titles: fresh.map((r) => r.title) });
-  return libraContext(context.repo, lines, "tell the developer about each in one short line, crediting Libra, then go on with what you were doing. If one bears on the current task, say how. Do not start new work because of it.");
+  const blocks = cleanNoteBlocks(response?.notes);
+  if (!blocks?.length) return null;
+  const rendered = renderNotes(blocks, { surface: "monitor", visible: false });
+  if (!rendered.contextLines.length) return null;
+  for (const note of rendered.surfaced) recordSurfaced(context, note);
+  return libraContext(context.repo, rendered.contextLines, rendered.howTo);
 }
 
 // ---------------------------------------------------------------------------

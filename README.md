@@ -76,6 +76,57 @@ Set `LIBRA_PLUGIN_SELF_UPDATE=0` to turn this off.
 reaches open sessions on their next action; the new hooks and the monitor start
 with the next session (or `/reload-plugins`).
 
+## The server writes the notes; the plugin shows them
+
+From 0.5.0, every note about production comes from Libra's API already written
+(`api/src/services/coding-agent-notes.ts`): the lines the developer sees, the
+text Claude gets, and which items are told only once. The server decides what is
+news, what a correction is, and what matches a request. The plugin only:
+
+- shows an item marked `once` at most once per machine, and an item that
+  `requires` another only on a machine that showed that one;
+- lays blocks out as one message (a `joinedLine` becomes a bullet in the first
+  block), with the `+N more` cut;
+- cleans and caps every field and wraps Claude's text in the
+  data-not-instructions envelope;
+- caches the register block for subagents and failed commands, and records what
+  it showed.
+
+A risk rule or a sentence therefore changes with an API deploy, not a plugin
+release. Text still written in the plugin, to move next: the failed-command
+match, the subagent instruction, commit-check notes, PR review notes, and the
+intro and feedback lines.
+
+### When to release a new plugin version
+
+Release only for a change that needs code on the developer's machine:
+
+- a new hook, or a change to when a hook runs or how long it may wait;
+- local machinery: the once-per-machine ledger, caches, the background sender,
+  monitor timing, the update handoff;
+- the safety envelope: cleaning, length caps, the wrapper;
+- a new field in the note contract that the renderer cannot show yet.
+
+Never release for what counts as news, a correction or a match; for any wording
+a developer or Claude reads; or for thresholds, severities, proof rules or mutes.
+Those are API deploys. If one seems to need the plugin, add a generic field to
+the note contract once, then keep using it from the server.
+
+How to release:
+
+1. Bump `PLUGIN_VERSION` in `scripts/libra-hook.mjs`: patch for a fix, minor for
+   a new hook or contract field. Never add `version` to `plugin.json`.
+2. Deploy the API first. It keeps answering every plugin version still reported
+   in `developer_sessions` metadata (`activeRisks`, `reviewQueue` and
+   `promptMatches` stay until no session reports a version before 0.5.0).
+3. Run `node --test libra-claude-code/scripts/libra-hook.test.mjs`. CI does not run
+   it. The tests build their notes with the real server code, so they cover the
+   whole path.
+4. Publish from merged `main` to `exla-ai/libra-claude-code`. Open sessions pick
+   it up within about 15 minutes.
+5. At most one release a day, unless it fixes something broken on a developer's
+   machine. Batch the rest.
+
 ## Speed: only answering hooks wait
 
 Only the hooks whose answer depends on Libra wait for the network: session start,
@@ -108,10 +159,9 @@ Libra · new in cedar-mail production
   Claude has the details.
 ```
 
-A risk appears once, the first session after Libra confirms it in production
-(P1 or P2, first seen in the last 72 hours). It is not shown again on this machine.
-With nothing new, the developer sees nothing; Claude still gets the open production
-risks as context. A change in the fix PRs waiting for review is a one-line note on
+A risk appears once, the first session after Libra confirms its observed failure in production
+(P1 or P2, first seen or confirmed in the last 72 hours). The same confirmation episode is not shown again on this machine. An explicitly reopened investigation with fresh proof starts a new episode; ordinary evidence refreshes stay quiet.
+With nothing new, the developer sees nothing; Claude gets confirmed observations as context. Unproven investigations appear only when requested through `libra_list_risks`, with their caveats and recheck deadline. A written brief is not confirmation. Expired and retracted investigations are excluded from active risk lists, prompt matches, and new-risk notes. For 72 hours, on-demand risk reads and relevant questions also show a retraction or resolution, with its reason, time, and the earlier claim clearly labeled. With `LIBRA_CODING_AGENT_CORRECTIONS_ENABLED=true` on the API, a developer who was shown the risk also gets it once, unasked: a "Libra · update on <repo> production" block at the next session start, or a monitor note in an open session. Nobody who never saw the claim hears about it. A deadline expires the evidence; it does not mean an automatic recheck ran. A change in the fix PRs waiting for review is a one-line note on
 its own. The very first session ever shows `Libra · on for <repo>` with one line
 naming `/libra-feedback`, and `/libra-login` always confirms `Libra · on for <repo>`.
 
@@ -162,6 +212,13 @@ credit Libra whenever it relays something:
 - **Why it matters:** <impact from Libra's data>
 - **What I'm doing about it:** <your next step>
 ```
+
+From 0.5.0, saved session context expires after at most ten minutes, or sooner at a
+risk's recheck deadline. A successful empty refresh clears old context. An idle or
+offline session does not keep handing stale risks to new subagents. Previously
+shown text remains in the conversation, so a current-state answer always needs a
+fresh scoped read. Corrections must distinguish a retracted claim from a verified
+recovery, without claiming the earlier period was healthy.
 
 **`/libra` answers**
 
