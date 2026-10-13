@@ -71,6 +71,26 @@ open sessions pick up an update on their next action, without a restart. A
 change to which hooks are registered still needs a restart or `/reload-plugins`.
 Set `LIBRA_PLUGIN_SELF_UPDATE=0` to turn this off.
 
+0.4.0 registers new hooks (`PostToolUseFailure`, `SubagentStart`, async
+`PostToolUse` and `PostCompact`) and a session monitor. The faster hook script
+reaches open sessions on their next action; the new hooks and the monitor start
+with the next session (or `/reload-plugins`).
+
+## Speed: only answering hooks wait
+
+Only the hooks whose answer depends on Libra wait for the network: session start,
+your prompt, a `git commit`, and Stop. Every other hook (each tool call, a
+compaction, a subagent starting, the end of a session) writes its event to a local
+spool in about 50 ms and returns. One detached sender per session posts the spool
+in batches a moment later, and answering hooks carry whatever is spooled. Before
+0.4.0 every tool call waited on a request whose answer nobody read, about half a
+second each, twice per Bash command. `PostToolUse` and `PostCompact` are also
+`async` in `hooks.json`, so Claude Code does not wait for them at all.
+
+The sender outlives the hook, so the end of a session is no longer lost to Claude
+Code's 1.5-second `SessionEnd` budget. A failed send keeps every event on disk for
+the next one. `LIBRA_HOOK_FLUSH=inline` sends inside the hook instead.
+
 ## What you see in a session
 
 Libra speaks up in short blocks: a header line that starts with `Libra`, then a few
@@ -204,10 +224,36 @@ dies with the session, so the review also stays on the PR on GitHub. It needs Cl
 Code 2.1.287 or newer (read from the session transcript) and stays off on older
 versions, which may not run hooks in the background.
 
+**The session monitor** (`monitors/monitors.json`, interactive sessions only) checks
+Libra once a minute. While the session watches a PR it delivers the finished review
+as soon as it lands, mid-turn or idle, so the Stop watcher above stands down while
+the monitor runs. While you are active (a prompt in the last two hours) it also asks,
+at most every ten minutes, for production risks that became news, and tells Claude
+about each once on this machine. A window left open for days makes no requests. Each
+tick is a fresh process, so it always runs the newest installed copy, and it ends
+when Claude Code exits.
+
 What the plugin sends for this: the PR numbers it noticed (`watch.prs`) with each
 event batch. A repo with no GitHub remote has no PRs to watch. Each block shown is
-recorded as a `libra_surfaced` note (`pr_watch`, `pr_review`, `pr_review_stop`, `pr_review_wake`) with
-the PR number and run id.
+recorded as a `libra_surfaced` note (`pr_watch`, `pr_review`, `pr_review_stop`, `pr_review_wake`,
+`pr_review_monitor`, `monitor_news`) with the PR number and run id.
+
+## Subagents and failing commands (Claude only)
+
+**Subagents start with the production picture.** A subagent begins with none of the
+session's context. `SubagentStart` gives it the same open production risks the session
+got at start, read from a local copy, so it costs no request. Claude Code's own
+helpers (status line setup, the docs guide) get nothing.
+
+**A failing command that matches a production error.** Session start also returns the
+specific production error messages Libra has seen for the repo in the last 14 days
+(generic ones such as `read econnreset` or a bare 404 are left out). When a tool call
+fails, `PostToolUseFailure` matches its output against them on your machine, with no
+request: ids and numbers are compared the way Libra groups production errors. A match
+tells Claude that this local failure is an error production users also hit, with how
+often and how recently, once per production error per session. You see nothing
+directly; Claude decides whether to mention it. Both are recorded as `libra_surfaced`
+notes (`subagent_context`, `failure_match`) with `shownToUser: false`.
 
 ## Feedback
 
@@ -242,6 +288,7 @@ Only what Libra needs to reason, never raw secrets or full file contents:
 - bounded sanitized transcript summaries when the agent hook exposes a transcript path,
 - bounded sanitized transcript entries only if full transcript capture is explicitly enabled,
 - the numbers of the PRs your session works on (`watch.prs`), so Libra can bring its review back,
+- the error text of a failed tool call (capped at 4,000 characters), and the type of a subagent that starts,
 - a record of each Libra block shown in the session (`libra_surfaced`) and any feedback you
   send (`libra_feedback`), so Libra can measure which notes help.
 

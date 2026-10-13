@@ -154,8 +154,10 @@ async function withApi(routes, fn) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Hooks that only record send in the background in production; tests send in
+// the hook itself unless they say otherwise, so one hook is one request.
 async function runHook({ api, home, cwd, input, args = ["claude-code"], stdin, token = "libra_exla-api-key-test", env: extraEnv = {} }) {
-  const env = { ...process.env, HOME: home, LIBRA_API_URL: api, ...extraEnv };
+  const env = { ...process.env, HOME: home, LIBRA_API_URL: api, LIBRA_HOOK_FLUSH: "inline", ...extraEnv };
   delete env.CLAUDE_CODE_SESSION_ID;
   if (token) env.LIBRA_API_TOKEN = token; else delete env.LIBRA_API_TOKEN;
   const child = spawn("node", [HOOK, ...args], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
@@ -279,7 +281,7 @@ test("SessionStart shows the developer only production risks that are new to the
     for (const sessionId of ["sess-a", "sess-c", "sess-e"]) {
       await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUse", session_id: sessionId, cwd: repo, tool_name: "Read" } });
     }
-    assert.equal(requests.at(-1).body.metadata.pluginVersion, "0.3.4");
+    assert.equal(requests.at(-1).body.metadata.pluginVersion, "0.4.0");
     const surfaced = requests.flatMap((r) => r.body.events || []).filter((e) => e.type === "libra_surfaced" && e.payload.kind === "session_start");
     const intro = surfaced.filter((e) => e.payload.introShown);
     assert.equal(intro.length, 1);
@@ -921,7 +923,7 @@ test("Surfaced notes are one file per event and are deleted only after a request
 });
 
 function spawnHook({ api, home, cwd, input, args = ["claude-code"], env = {} }) {
-  const childEnv = { ...process.env, HOME: home, LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test", ...env };
+  const childEnv = { ...process.env, HOME: home, LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test", LIBRA_HOOK_FLUSH: "inline", ...env };
   delete childEnv.CLAUDE_CODE_SESSION_ID;
   const child = spawn("node", [HOOK, ...args], { cwd, env: childEnv, stdio: ["pipe", "pipe", "pipe"] });
   let stdout = "";
@@ -1708,8 +1710,21 @@ test("The Stop hook is registered, and the Codex installer is unchanged", () => 
     // so a review that lands while the session is idle wakes Claude.
     { type: "command", command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs" watch', async: true, asyncRewake: true, timeout: 1800 },
   ] }]);
-  for (const event of ["SessionStart", "UserPromptSubmit", "PostToolUse", "PreToolUse", "PostCompact", "SessionEnd"]) assert.ok(hooks[event], `${event} is still registered`);
-  assert.equal(hooks.PostToolUse[0].hooks[0].command, hooks.Stop[0].hooks[0].command, "one script handles every event");
+  for (const event of ["SessionStart", "UserPromptSubmit", "PostToolUse", "PreToolUse", "PostCompact", "SessionEnd", "PostToolUseFailure", "SubagentStart"]) assert.ok(hooks[event], `${event} is still registered`);
+  const script = 'node "${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs" claude-code';
+  // Only hooks that can answer wait; recording-only hooks run in the background.
+  for (const event of ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUseFailure", "SubagentStart", "SessionEnd"]) {
+    assert.equal(hooks[event][0].hooks[0].command, script, `${event} runs the one script in the foreground`);
+    assert.equal(hooks[event][0].hooks[0].async, undefined, `${event} is not async`);
+  }
+  for (const event of ["PostToolUse", "PostCompact"]) {
+    assert.deepEqual(hooks[event], [{ hooks: [{ type: "command", command: `${script} async`, async: true, timeout: 30 }] }], `${event} never holds up Claude`);
+  }
+  assert.equal(hooks.PreToolUse[0].matcher, "Bash", "the commit check needs only Bash");
+  const monitors = JSON.parse(fs.readFileSync(path.join(ROOT, "monitors", "monitors.json"), "utf8"));
+  assert.equal(monitors.length, 1);
+  assert.equal(monitors[0].name, "libra");
+  assert.match(monitors[0].command, /libra-hook\.mjs" monitor; \[ \$\? -eq 3 \] && break; sleep 60; done$/);
 });
 
 // Background review watcher (Stop, async + asyncRewake): wakes an idle session
@@ -1946,4 +1961,316 @@ test("With auto-update on, hooks refresh the plugin in the background at most ev
   await runInstalled({ ...makeInstall({ autoUpdate: true }), env, args: ["feedback", "useful"] });
   await sleep(500);
   assert.deepEqual(lines(), [], "no refresh without an explicit auto-update opt-in");
+});
+
+// ---------------------------------------------------------------------------
+// Plugin 0.4.0: hooks that only record do not wait on the network, subagents
+// get production context, failures are matched against production errors, and
+// a session monitor delivers news and reviews.
+
+const BACKGROUND = { LIBRA_HOOK_FLUSH: "background", LIBRA_HOOK_FLUSH_DEBOUNCE_MS: "50", LIBRA_HOOK_FLUSH_INTERVAL_MS: "100" };
+const spoolFiles = (home, sid) => {
+  try { return fs.readdirSync(path.join(home, ".config/libra/coding-agent", `${sessionHash(sid)}.spool`)).filter((n) => n.endsWith(".json")); } catch { return []; }
+};
+async function waitUntil(check, ms = 5_000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (check()) return true;
+    await sleep(25);
+  }
+  return check();
+}
+
+test("A tool call records locally and returns at once; a background sender posts the batch", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-bg";
+  let hang = true;
+  await withApi({ [EVENTS]: () => (hang ? HANG : { ok: true }) }, async (api, requests) => {
+    // Even with a server that never answers, the hook itself is quick.
+    const started = Date.now();
+    const run = await runHook({ api, home, cwd: repo, env: { ...BACKGROUND, LIBRA_HOOK_FLUSH_DEBOUNCE_MS: "5000" }, input: bash(sid, repo, "ls -la") });
+    const elapsed = Date.now() - started;
+    assert.equal(run.code, 0);
+    assert.equal(run.stdout, "");
+    assert.ok(elapsed < 1_000, `the hook did not wait for the network: ${elapsed}ms`);
+    assert.equal(requests.length, 0, "the hook made no request itself");
+    assert.equal(spoolFiles(home, sid).length, 1, "the event waits in the spool");
+  });
+
+  // A fresh home: the sender above is still sleeping on its long debounce.
+  const home2 = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  hang = false;
+  await withApi({ [EVENTS]: () => ({ ok: true }) }, async (api, requests) => {
+    for (const command of ["ls", "pwd", "git status"]) {
+      await runHook({ api, home: home2, cwd: repo, env: BACKGROUND, input: bash(sid, repo, command, { event: "PreToolUse" }) });
+      await runHook({ api, home: home2, cwd: repo, env: BACKGROUND, input: bash(sid, repo, command) });
+    }
+    assert.ok(await waitUntil(() => spoolFiles(home2, sid).length === 0), "the sender emptied the spool");
+    const sent = requests.flatMap((r) => r.body.events || []).filter((e) => e.type === "pre_tool_use" || e.type === "post_tool_use");
+    assert.equal(sent.length, 6, "every tool event reached the server");
+    assert.ok(requests.length <= 3, `a burst goes out in a few batches, not one per hook: ${requests.length}`);
+    assert.ok(sent.every((e) => /^[0-9a-f]{40}$/.test(e.sourceHead || "") || e.sourceHead === null), "the sender stamps the head it sees");
+    assert.equal(requests[0].body.metadata.pluginVersion, "0.4.0");
+  });
+});
+
+test("The end of a session is sent after the hook exits, past the 1.5 second budget", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-end";
+  await withApi({ [EVENTS]: async () => { await sleep(1_800); return { ok: true }; } }, async (api, requests) => {
+    const started = Date.now();
+    const run = await runHook({ api, home, cwd: repo, env: BACKGROUND, input: { hook_event_name: "SessionEnd", session_id: sid, cwd: repo, reason: "prompt_input_exit" } });
+    assert.ok(Date.now() - started < 1_000, "the hook is done well inside the budget");
+    assert.equal(run.code, 0);
+    assert.ok(await waitUntil(() => spoolFiles(home, sid).length === 0, 6_000), "the detached sender finished the slow request");
+    const end = requests.flatMap((r) => r.body.events || []).find((e) => e.type === "session_end");
+    assert.equal(end.payload.reason, "prompt_input_exit");
+  });
+});
+
+test("Answering hooks carry spooled events, and a failed send keeps them", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-carry";
+  let up = false;
+  await withApi({ [EVENTS]: () => (up ? { ok: true, promptMatches: PROMPT_MATCHES } : null) }, async (api, requests) => {
+    await runHook({ api, home, cwd: repo, env: { LIBRA_HOOK_FLUSH: "off" }, input: bash(sid, repo, "ls") });
+    await runHook({ api, home, cwd: repo, env: { LIBRA_HOOK_FLUSH: "off" }, input: bash(sid, repo, "pwd") });
+    assert.equal(spoolFiles(home, sid).length, 2);
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "UserPromptSubmit", session_id: sid, cwd: repo, prompt: "why are gmail drafts missing" } });
+    assert.equal(spoolFiles(home, sid).length, 2, "a failed send deletes nothing");
+    up = true;
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "UserPromptSubmit", session_id: sid, cwd: repo, prompt: "why are gmail drafts missing again" } });
+    const last = requests.at(-1).body;
+    assert.equal(last.events[0].type, "user_prompt_submit", "the prompt leads its batch");
+    assert.deepEqual(last.events.filter((e) => e.type === "post_tool_use").map((e) => e.payload.tool_input.command), ["ls", "pwd"]);
+    assert.equal(spoolFiles(home, sid).length, 0);
+  });
+});
+
+test("A review the sender heard about shows on the next tool call, never from an async hook", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-stash";
+  const dir = path.join(home, ".config/libra/coding-agent");
+  fs.mkdirSync(dir, { recursive: true });
+  const stash = (at) => fs.writeFileSync(path.join(dir, `${sessionHash(sid)}.inbox.json`), JSON.stringify({ at, repo: "https://github.com/acme/app.git", inbox: { prs: [reviewedEntry()] } }));
+  await withApi({ [EVENTS]: () => ({ ok: true }) }, async (api, requests) => {
+    const off = { LIBRA_HOOK_FLUSH: "off" };
+    stash(Date.now() - 11 * 60_000);
+    assert.equal((await runHook({ api, home, cwd: repo, env: off, input: bash(sid, repo, "ls") })).stdout, "", "a stale stash is ignored");
+    stash(Date.now());
+    const viaAsync = await runHook({ api, home, cwd: repo, env: off, args: ["claude-code", "async"], input: bash(sid, repo, "ls") });
+    assert.equal(viaAsync.stdout, "", "an async hook never claims a review: its output would reach only Claude, a turn late");
+    const shown = JSON.parse((await runHook({ api, home, cwd: repo, env: off, input: bash(sid, repo, "ls") })).stdout);
+    assert.match(assertVisibleBlock(shown.systemMessage, "review")[0], /^Libra · review of PR #3045/);
+    assert.equal(shown.hookSpecificOutput.hookEventName, "PostToolUse");
+    assert.equal((await runHook({ api, home, cwd: repo, env: off, input: bash(sid, repo, "ls") })).stdout, "", "shown once");
+    assert.equal(requests.length, 0, "all of it without a request");
+  });
+});
+
+function seedContext(home, sid, context) {
+  const dir = path.join(home, ".config/libra/coding-agent");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${sessionHash(sid)}.context.json`), JSON.stringify({ at: Date.now(), repo: "https://github.com/acme/app.git", ...context }));
+}
+
+const SIGNATURES = [
+  { key: "fam-dup", environment: "prod", exceptionType: "23505", signature: "duplicate key value violates unique constraint \"uq_crm_contacts_user_person\"", count: 176, firstSeenAt: agoIso(10 * 24 * HOUR), lastSeenAt: agoIso(5 * HOUR) },
+  { key: "fam-slack", environment: "prod", exceptionType: "Error", signature: "user <redacted-token> is not authenticated with slack", count: 663, firstSeenAt: agoIso(20 * 24 * HOUR), lastSeenAt: agoIso(HOUR) },
+  { key: "fam-conn", environment: "prod", exceptionType: "no_connection_found", signature: "", count: 242, firstSeenAt: agoIso(3 * 24 * HOUR), lastSeenAt: agoIso(2 * HOUR) },
+  { key: "fam-ro", environment: "staging", exceptionType: "25006", signature: "cannot execute insert in a read-only transaction", count: 762, firstSeenAt: agoIso(9 * 24 * HOUR), lastSeenAt: agoIso(7 * HOUR) },
+];
+
+test("Session start saves the production picture; a subagent gets it, Claude only", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-sub";
+  await withApi({ [EVENTS]: () => ({ ok: true, activeRisks: RISKS, errorSignatures: SIGNATURES }) }, async (api, requests) => {
+    const sub = (agentType) => runHook({ api, home, cwd: repo, input: { hook_event_name: "SubagentStart", session_id: sid, cwd: repo, agent_id: "agent-1", agent_type: agentType } });
+    assert.equal((await sub("Explore")).stdout, "", "no session start yet, nothing to give");
+
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionStart", source: "startup", session_id: sid, cwd: repo } });
+    const before = requests.length;
+    const out = JSON.parse((await sub("Explore")).stdout);
+    assert.equal(out.systemMessage, undefined, "the developer sees nothing");
+    assert.equal(out.hookSpecificOutput.hookEventName, "SubagentStart");
+    assertContextBlock(out.hookSpecificOutput.additionalContext);
+    assert.match(out.hookSpecificOutput.additionalContext, /1\. \[P2 prod\] Gmail thread reads return 404/);
+    assert.match(out.hookSpecificOutput.additionalContext, /How to use this: if your task touches one of these areas/);
+    assert.equal((await sub("statusline-setup")).stdout, "", "helpers with nothing to do with production get nothing");
+    assert.equal((await runHook({ api, home, cwd: repo, args: ["codex"], input: { hook_event_name: "SubagentStart", session_id: sid, cwd: repo, agent_type: "Explore" } })).stdout, "");
+    const started = requests.slice(before).flatMap((r) => r.body.events || []);
+    assert.ok(started.some((e) => e.type === "subagent_start" && e.payload.agent_type === "Explore"), "subagent starts are recorded");
+    assert.ok(started.some((e) => e.type === "libra_surfaced" && e.payload.kind === "subagent_context" && e.payload.shownToUser === false));
+  });
+});
+
+test("A failed command that matches a production error tells Claude once a session", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-fail";
+  seedContext(home, sid, { errorSignatures: SIGNATURES, riskLines: [] });
+  await withApi({ [EVENTS]: () => ({ ok: true }) }, async (api, requests) => {
+    const fail = (error, extra = {}) => runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUseFailure", session_id: sid, cwd: repo, tool_name: "Bash", tool_input: { command: "pnpm test crm" }, error, ...extra } });
+    const hit = await fail("Exit code 1\n FAIL src/crm/contacts.test.ts\nPostgresError: duplicate key value violates unique constraint \"uq_crm_contacts_user_person\"\n    at insertContact (src/crm/contacts.ts:41:9)");
+    const out = JSON.parse(hit.stdout);
+    assert.equal(out.systemMessage, undefined, "Claude only");
+    assert.equal(out.hookSpecificOutput.hookEventName, "PostToolUseFailure");
+    const ctx = out.hookSpecificOutput.additionalContext;
+    assertContextBlock(ctx);
+    assert.match(ctx, /1\. \[prod\] duplicate key value violates unique constraint "uq_crm_contacts_user_person" \(176 occurrences, last seen 5h ago\)/);
+    assert.equal((await fail("Exit code 1\nduplicate key value violates unique constraint \"uq_crm_contacts_user_person\"")).stdout, "", "once a session per production error");
+
+    // Redacted values and digits in the signature match any local value.
+    const slack = JSON.parse((await fail("Exit code 1\nError: User 8f3e2c1a-0b4d-4e6f-9a7b-1c2d3e4f5a6b is not authenticated with Slack")).stdout);
+    assert.match(slack.hookSpecificOutput.additionalContext, /is not authenticated with slack \(663 occurrences/);
+    // A specific error code alone is enough; a staging signature says so.
+    assert.match(JSON.parse((await fail("Exit code 1\n{ code: 'no_connection_found' }")).stdout).hookSpecificOutput.additionalContext, /\[prod\] no_connection_found/);
+    assert.match(JSON.parse((await fail("Exit code 1\nerror: cannot execute INSERT in a read-only transaction")).stdout).hookSpecificOutput.additionalContext, /\[staging\] cannot execute insert/);
+
+    for (const miss of [
+      "Exit code 1\nTypeError: Cannot read properties of undefined (reading 'id')",
+      "Exit code 2\nerror TS2304: Cannot find name 'foo'.",
+      "short",
+    ]) assert.equal((await fail(miss)).stdout, "", `no match: ${miss}`);
+    assert.equal((await fail("duplicate key value violates unique constraint \"uq_crm_contacts_user_person\"", { session_id: "sess-int", is_interrupt: true })).stdout, "", "an interrupted call is not a failure");
+    assert.equal((await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUseFailure", session_id: "sess-none", cwd: repo, tool_name: "Bash", error: "duplicate key value violates unique constraint \"uq_crm_contacts_user_person\"" } })).stdout, "", "no saved signatures, no match");
+
+    const events = requests.flatMap((r) => r.body.events || []);
+    assert.ok(events.some((e) => e.type === "post_tool_use_failure" && /Tool failed: Bash pnpm test crm/.test(e.summary) && /duplicate key/.test(e.payload.error)));
+    assert.ok(events.some((e) => e.type === "libra_surfaced" && e.payload.kind === "failure_match"));
+  });
+});
+
+async function runMonitor({ api, home, cwd, sid, env: extraEnv = {} }) {
+  const env = { ...process.env, HOME: home, LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test", CLAUDE_CODE_SESSION_ID: sid, ...extraEnv };
+  delete env.CLAUDE_PID;
+  if (extraEnv.CLAUDE_PID) env.CLAUDE_PID = extraEnv.CLAUDE_PID;
+  const child = spawn("node", [HOOK, "monitor"], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  const code = await new Promise((resolve) => child.on("exit", resolve));
+  return { code, stdout };
+}
+
+const MONITOR = "/developer-sessions/monitor";
+const NEWS = { count: 3, top: [], recent: [{ id: "cand-news", severity: "P2", environment: "prod", title: "Mail views fail to load after reconnect", firstSeenAt: agoIso(40 * 60_000) }] };
+
+test("The monitor asks nothing of an idle session, and tells an active one about new production risks once", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-mon";
+  await withApi({ [MONITOR]: () => ({ ok: true, activeRisks: NEWS, errorSignatures: SIGNATURES }), [EVENTS]: () => ({ ok: true }) }, async (api, requests) => {
+    const idle = await runMonitor({ api, home, cwd: repo, sid });
+    assert.equal(idle.code, 0);
+    assert.equal(idle.stdout, "");
+    assert.equal(requests.length, 0, "no prompt yet: no request");
+
+    // Session start just looked for news, so the monitor's first tick does not.
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionStart", source: "startup", session_id: sid, cwd: repo } });
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "");
+    assert.equal(requests.filter((r) => r.url === MONITOR).length, 0);
+    fs.rmSync(path.join(home, ".config/libra/coding-agent", `${sessionHash(sid)}.monitor-state.json`));
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "UserPromptSubmit", session_id: sid, cwd: repo, prompt: "add retry to the mail view loader" } });
+    const tick = await runMonitor({ api, home, cwd: repo, sid });
+    assert.equal(tick.code, 0);
+    const monitorCall = requests.find((r) => r.url === MONITOR);
+    assert.equal(monitorCall.body.risks, true);
+    assert.equal(monitorCall.body.sessionId, sid);
+    assertContextBlock(tick.stdout.trim());
+    assert.match(tick.stdout, /New production risks Libra confirmed while you were working:\n1\. \[P2 prod\] Mail views fail to load after reconnect \(started \d+m ago\)/);
+    assert.match(tick.stdout, /How to use this: tell the developer about each in one short line, crediting Libra/);
+
+    const calls = requests.filter((r) => r.url === MONITOR).length;
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", "news is asked for at most every ten minutes");
+    assert.equal(requests.filter((r) => r.url === MONITOR).length, calls);
+    const again = await runMonitor({ api, home, cwd: repo, sid, env: { LIBRA_HOOK_MONITOR_NEWS_MS: "1" } });
+    assert.equal(again.stdout, "", "a risk is news once");
+    // The refreshed signatures reach a later failure.
+    const fail = await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUseFailure", session_id: sid, cwd: repo, tool_name: "Bash", error: "Exit code 1\nduplicate key value violates unique constraint \"uq_crm_contacts_user_person\"" } });
+    assert.match(fail.stdout, /uq_crm_contacts_user_person/);
+    // Session start does not show it again either.
+    const start = await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionStart", source: "startup", session_id: "sess-mon-2", cwd: repo } });
+    assert.doesNotMatch(start.stdout, /Mail views fail/);
+  });
+});
+
+test("The monitor delivers a finished review of a watched PR once, and the Stop watcher stands down for it", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-mon-pr";
+  let inbox = [REVIEWING];
+  await withApi({ [MONITOR]: () => ({ ok: true, inbox: { prs: inbox } }), [EVENTS]: () => ({ ok: true, inbox: { prs: inbox } }) }, async (api, requests) => {
+    seedWatch(home, sid);
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", "still reviewing");
+    assert.deepEqual(requests.at(-1).body.watch, { prs: [3045] });
+    assert.equal(requests.at(-1).body.risks, false, "an inactive session is not asked about news");
+
+    const watcher = await runWatcher({ api, home, cwd: repo, sid });
+    assert.equal(watcher.code, 0, "a live monitor covers reviews, so the watcher exits at once");
+
+    inbox = [reviewedEntry()];
+    const tick = await runMonitor({ api, home, cwd: repo, sid });
+    assertContextBlock(tick.stdout.trim());
+    assert.match(tick.stdout, /Libra's review of this PR finished\. When you reach a stopping point/);
+    assert.match(tick.stdout, /Gmail thread reads return 404/);
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", "delivered once");
+    const stop = await runHook({ api, home, cwd: repo, input: { hook_event_name: "Stop", session_id: sid, cwd: repo } });
+    assert.equal(stop.stdout, "", "Stop does not raise it again");
+  });
+});
+
+test("The monitor follows the session after /clear and ends when Claude Code is gone", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  await withApi({ [MONITOR]: () => ({ ok: true, activeRisks: NEWS }), [EVENTS]: () => ({ ok: true }) }, async (api, requests) => {
+    const env = { CLAUDE_PID: String(process.pid) };
+    await runHook({ api, home, cwd: repo, env, input: { hook_event_name: "UserPromptSubmit", session_id: "sess-after-clear", cwd: repo, prompt: "add retry to the mail view loader" } });
+    await runMonitor({ api, home, cwd: repo, sid: "sess-before-clear", env });
+    assert.equal(requests.find((r) => r.url === MONITOR)?.body.sessionId, "sess-after-clear", "the monitor asks for the session Claude Code is on now");
+
+    const dead = spawn("node", ["-e", "0"]);
+    await new Promise((resolve) => dead.on("exit", resolve));
+    const gone = await runMonitor({ api, home, cwd: repo, sid: "sess-after-clear", env: { CLAUDE_PID: String(dead.pid) } });
+    assert.equal(gone.code, 3, "exit code 3 ends the monitor's shell loop");
+  });
+});
+
+test("The monitor stays silent when the server has no monitor endpoint yet", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-mon-old";
+  await withApi({ [MONITOR]: () => null, [EVENTS]: () => ({ ok: true }) }, async (api) => {
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "UserPromptSubmit", session_id: sid, cwd: repo, prompt: "add retry to the mail view loader" } });
+    seedWatch(home, sid);
+    const tick = await runMonitor({ api, home, cwd: repo, sid });
+    assert.equal(tick.code, 0);
+    assert.equal(tick.stdout, "");
+  });
+});
+
+test("Subagent and failure answers work on the production path, where nothing waits on a sender", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-prodpath";
+  seedContext(home, sid, {
+    riskLines: ["Open production risks (1):", "1. [P2 prod] Gmail thread reads return 404"],
+    riskTitles: ["Gmail thread reads return 404"],
+    // Unnormalized digits still match: the plugin normalizes both sides.
+    errorSignatures: [{ key: "fam-raw", environment: "prod", exceptionType: "23505", signature: "duplicate key value violates unique constraint \"uq_e2e_widgets_owner\"", count: 3 }],
+  });
+  await withApi({ [EVENTS]: () => ({ ok: true }) }, async (api) => {
+    const off = { LIBRA_HOOK_FLUSH: "off" };
+    const sub = await runHook({ api, home, cwd: repo, env: off, input: { hook_event_name: "SubagentStart", session_id: sid, cwd: repo, agent_type: "general-purpose" } });
+    assert.match(JSON.parse(sub.stdout).hookSpecificOutput.additionalContext, /Gmail thread reads return 404/);
+    const fail = await runHook({ api, home, cwd: repo, env: off, input: { hook_event_name: "PostToolUseFailure", session_id: sid, cwd: repo, tool_name: "Bash", error: "Exit code 1\nPostgresError: duplicate key value violates unique constraint \"uq_e2e_widgets_owner\"" } });
+    assert.match(JSON.parse(fail.stdout).hookSpecificOutput.additionalContext, /uq_e#e_widgets_owner|uq_e2e_widgets_owner/);
+    const gh = await runHook({ api, home, cwd: repo, env: off, input: bash(sid, repo, "gh pr checks 3045") });
+    assert.equal(gh.code, 0);
+    assert.deepEqual(watchFiles(home, sid), ["3045.json"], "a gh command is still noticed with no sender");
+  });
 });

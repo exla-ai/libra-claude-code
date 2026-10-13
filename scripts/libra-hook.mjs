@@ -8,11 +8,11 @@ import { fileURLToPath } from "node:url";
 
 const DEFAULT_API = "https://api.libra.exla.ai";
 const MAX_TRANSCRIPT_BYTES_PER_HOOK = 80_000;
-const MAX_EVENTS_PER_POST = 40;
+const MAX_EVENTS_PER_POST = 50;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "0.3.4";
+const PLUGIN_VERSION = "0.4.0";
 const MAX_PENDING_SURFACED = 10;
 // Fast updates (see runNewestInstalledCopy): where this copy lives, how often
 // a hook may ask Claude Code to refresh the plugin, and the size cap for
@@ -32,6 +32,44 @@ const HOOK_STARTED_AT = Date.now();
 const NETWORK_DEADLINE_MS = Number(process.env.LIBRA_HOOK_NETWORK_DEADLINE_MS) || 8_000;
 const MIN_REQUEST_BUDGET_MS = 250;
 const HARD_EXIT_MS = NETWORK_DEADLINE_MS + 1_300;
+// Background sending. Only hooks that can answer (session start, a prompt, a
+// commit, Stop) wait for the network. Every other hook (a tool call, a
+// compaction, a subagent, the end of a session) writes its event to a local
+// spool and returns, and one detached sender per session posts the spool in
+// batches. A tool call used to wait about half a second for a POST whose answer
+// nobody read, twice per Bash command. LIBRA_HOOK_FLUSH=inline sends in the
+// hook itself instead (tests), and =off never starts a sender.
+const FLUSH_SETTING = process.env.LIBRA_HOOK_FLUSH || "background";
+const FLUSH_DEBOUNCE_MS = Number(process.env.LIBRA_HOOK_FLUSH_DEBOUNCE_MS ?? 1_500);
+const FLUSH_INTERVAL_MS = Number(process.env.LIBRA_HOOK_FLUSH_INTERVAL_MS ?? 3_000);
+const FLUSH_IDLE_ROUNDS = 2;
+const FLUSH_MAX_MS = 60_000;
+const FLUSH_REQUEST_MS = 8_000;
+// A sender refreshes its lock before every request (8 s at most) and sleep, so a
+// lock this old is dead. A failed send keeps the lock until it ages out, so an
+// offline machine starts one sender per 20 seconds, not one per tool call.
+const FLUSH_LOCK_STALE_MS = 20_000;
+const MAX_SPOOL_PER_POST = 30;
+const MAX_SPOOL_FILES = 2_000;
+// The inbox a sender received, kept so a later tool call can show a finished
+// review without waiting on the network itself.
+const INBOX_STASH_MAX_AGE_MS = 10 * 60_000;
+// Only one process reads new transcript lines at a time, or two would send the
+// same lines under different sequences.
+const TRANSCRIPT_LOCK_STALE_MS = 10_000;
+// The session monitor (monitors/monitors.json) runs `monitor` once a minute.
+// It asks the server only when the session watches a PR, or, at most every ten
+// minutes, for news while the developer is active (a prompt in the last two
+// hours). Windows left open for days stay silent and cost no requests.
+const MONITOR_NEWS_INTERVAL_MS = Number(process.env.LIBRA_HOOK_MONITOR_NEWS_MS) || 10 * 60_000;
+const MONITOR_ACTIVE_MS = 2 * 60 * 60_000;
+const MONITOR_REQUEST_MS = 8_000;
+// A monitor this recently alive covers PR reviews, so the Stop watcher stands down.
+const MONITOR_ALIVE_MS = 3 * 60_000;
+// Exit code that ends the monitor's shell loop: the Claude Code process is gone.
+const MONITOR_PARENT_GONE = 3;
+const MAX_ERROR_SIGNATURES = 80;
+const MAX_FAILURE_SCAN = 20_000;
 // Background review watcher (Stop, async + asyncRewake in hooks.json). PR
 // sandbox runs average about 18 minutes, so it waits up to 25 minutes, under
 // the hook's 30-minute timeout, checking once every 45 seconds.
@@ -130,16 +168,35 @@ const FEEDBACK_RATINGS = [
 // A hook that hangs must still let Claude Code move on. The background
 // review watcher (`watch`) runs far longer by design and has its own ceiling.
 const WATCH_MODE = process.argv[2] === "watch";
-setTimeout(() => process.exit(0), WATCH_MODE ? WATCH_MAX_MS + 60_000 : HARD_EXIT_MS).unref();
+const FLUSH_MODE = process.argv[2] === "flush";
+// hooks.json runs PostToolUse and PostCompact with `async: true` and passes
+// "async": their output reaches Claude only on a later turn and never the
+// developer, so they deliver nothing and leave PR reviews to the monitor.
+const ASYNC_HOOK = process.argv[3] === "async";
+setTimeout(() => process.exit(0), WATCH_MODE ? WATCH_MAX_MS + 60_000 : FLUSH_MODE ? FLUSH_MAX_MS + FLUSH_REQUEST_MS + 15_000 : HARD_EXIT_MS).unref();
 
 main().catch(() => process.exit(0));
 
 async function main() {
+  // main() is called while this module is still being evaluated, so every
+  // `const` declared below the call is not initialized yet. Yield once and the
+  // module finishes first; without this a path with no await before it (a
+  // subagent, a failure) died on a constant and said nothing.
+  await Promise.resolve();
   const delegated = runNewestInstalledCopy();
   if (delegated != null) process.exit(delegated);
-  if (!WATCH_MODE && process.argv[2] !== "feedback") refreshInstallInBackground();
-  if (process.argv[2] === "feedback") {
+  const mode = process.argv[2];
+  if (mode === "flush") {
+    await runFlush();
+    return;
+  }
+  if (!WATCH_MODE && mode !== "feedback") refreshInstallInBackground();
+  if (mode === "feedback") {
     await runFeedback(process.argv.slice(3));
+    return;
+  }
+  if (mode === "monitor") {
+    await runMonitorTick();
     return;
   }
   if (WATCH_MODE) {
@@ -157,7 +214,6 @@ async function main() {
   if (!credentials.token) return;
 
   const agent = normalizeAgentName(process.argv[2] || input.agent || input.client || detectAgentFromEnv());
-  const repoInfo = resolveRepo(cwd);
 
   const sessionExternalId = String(
     input.session_id ||
@@ -171,29 +227,39 @@ async function main() {
     process.env.CODEX_COMPANION_SESSION_ID ||
     hash(`${cwd}:${input.transcript_path || Date.now()}`),
   );
-  const transcriptPath = findTranscriptPath(input, agent, sessionExternalId);
   const hookEvent = String(input.hook_event_name || input.hookEventName || input.event || "event");
+  const visible = agent === "claude-code";
+
+  // Hooks that cannot answer record their event locally and return at once.
+  const lane = hookLane(hookEvent, input);
+  if (lane !== "answer") {
+    const output = await localHook(lane, { input, hookEvent, config, agent, cwd, sessionExternalId, visible });
+    if (output) process.stdout.write(JSON.stringify(output));
+    return;
+  }
+
+  const repoInfo = resolveRepoCached(cwd);
+  const transcriptPath = findTranscriptPath(input, agent, sessionExternalId);
   // PRs this session is working on (from `gh pr ...` commands), sent with every
   // batch so the server can say where Libra's review of each one stands.
   const watchedPrs = trackWatchedPrs(input, hookEvent, sessionExternalId, repoInfo);
   const branch = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
   const head = git(["rev-parse", "HEAD"], cwd);
+  if (hookEvent === "SessionStart" || hookEvent === "UserPromptSubmit") {
+    noteSessionActivity(sessionExternalId, { cwd, transcriptPath: input.transcript_path || null });
+  }
   const events = buildEvents(input, hookEvent, config, agent, head);
   // Notes shown on earlier hooks ride along with this batch: recording them at
   // display time would add a second network call inside the hook deadline. Each
   // note is its own file, deleted only after a batch that carried it succeeds,
-  // so a hook killed mid-request loses nothing.
+  // so a hook killed mid-request loses nothing. Spooled tool events go too.
   const pending = peekPendingSurfaced(sessionExternalId);
+  const spooled = peekSpool(sessionExternalId, MAX_SPOOL_PER_POST);
+  const spooledItems = spooled.map((entry) => ({ entry, event: withSourceHead(entry.event, head) }));
   events.push(...pending.map((entry) => entry.event));
+  events.push(...spooledItems.map((item) => item.event));
+  events.push(...readTranscriptOnce(transcriptPath, sessionExternalId, config, agent));
 
-  if (transcriptPath && config.captureTranscript === true) {
-    events.push(...tailTranscriptEvents(transcriptPath, sessionExternalId, config, agent));
-  } else if (transcriptPath && config.captureTranscript === "summary") {
-    events.push(...tailTranscriptSummaries(transcriptPath, sessionExternalId, config, agent));
-  }
-
-  // Only Claude Code renders `systemMessage`; Codex keeps the context-only output.
-  const visible = agent === "claude-code";
   // Claude Code sends `source` (startup, resume, clear, compact) and a transcript
   // path; the manual heartbeat in /libra-login sends neither, so it must not use
   // up the one-time intro. After a compaction the agent context is re-injected
@@ -221,16 +287,7 @@ async function main() {
       head,
       client: agent,
       cwd,
-      metadata: {
-        agent,
-        hookEvent,
-        pluginVersion: PLUGIN_VERSION,
-        captureTranscript: config.captureTranscript,
-        transcriptPathDetected: Boolean(transcriptPath),
-        repoSource: repoInfo.source,
-        repoDetected: repoInfo.source !== "local",
-        ...(agent === "claude-code" && claudeCodeVersion(transcriptPath) ? { clientVersion: claudeCodeVersion(transcriptPath).join(".") } : {}),
-      },
+      metadata: sessionMetadata({ agent, hookEvent, config, transcriptPath, repoInfo }),
       events: sendEvents,
       ...(watchedPrs.length ? { watch: { prs: watchedPrs } } : {}),
     }).catch(() => null)
@@ -244,15 +301,85 @@ async function main() {
   if (response) {
     const sent = new Set(sendEvents);
     ackPendingSurfaced(pending.filter((entry) => sent.has(entry.event)));
+    ackPendingSurfaced(spooledItems.filter((item) => sent.has(item.event)).map((item) => item.entry));
+    if (response.inbox) writeInboxStash(sessionExternalId, repoInfo.repo, response.inbox);
   }
+  if (peekSpool(sessionExternalId, 1).length) startSender({ sessionExternalId, cwd, agent, transcriptPath: input.transcript_path || null });
 
   let output = null;
-  if (hookEvent === "SessionStart") output = sessionStartOutput(response, context);
+  if (hookEvent === "SessionStart") {
+    if (response) {
+      writeSessionContext(sessionExternalId, repoInfo.repo, response);
+      // Session start just looked for news; the monitor waits its full interval.
+      markMonitorNewsChecked(sessionExternalId);
+    }
+    output = sessionStartOutput(response, context);
+  }
   if (hookEvent === "UserPromptSubmit") output = promptMatchOutput(response, context);
   if (commitOutput) output = commitOutput;
   output = mergeHookOutput(output, prInboxOutput(response, hookEvent, input, context), hookEvent);
 
   if (output) process.stdout.write(JSON.stringify(output));
+}
+
+// "answer": the hook's output depends on the server, so it waits for it.
+// Everything else is answered from local state, or not at all.
+function hookLane(hookEvent, input) {
+  if (hookEvent === "SessionStart" || hookEvent === "UserPromptSubmit" || hookEvent === "Stop") return "answer";
+  if (hookEvent === "PreToolUse") {
+    const tool = String(input.tool_name || input.tool || "").toLowerCase();
+    const command = String(input.tool_input?.command ?? input.toolInput?.command ?? "");
+    if (tool === "bash" && /\bgit\s+commit\b/.test(command)) return "answer";
+    return "record";
+  }
+  if (hookEvent === "SubagentStart") return "subagent";
+  if (hookEvent === "PostToolUseFailure") return "failure";
+  // The manual heartbeat in /libra-login and unknown events keep the old path.
+  if (hookEvent === "event") return "answer";
+  return "record";
+}
+
+function sessionMetadata({ agent, hookEvent, config, transcriptPath, repoInfo }) {
+  const clientVersion = agent === "claude-code" ? claudeCodeVersion(transcriptPath) : null;
+  return {
+    agent,
+    hookEvent,
+    pluginVersion: PLUGIN_VERSION,
+    captureTranscript: config.captureTranscript,
+    transcriptPathDetected: Boolean(transcriptPath),
+    repoSource: repoInfo.source,
+    repoDetected: repoInfo.source !== "local",
+    ...(clientVersion ? { clientVersion: clientVersion.join(".") } : {}),
+  };
+}
+
+function withSourceHead(event, head) {
+  return event.sourceHead || !head ? event : { ...event, sourceHead: head };
+}
+
+// A hook that records and returns. A tool call, a compaction, or the end of a
+// session only spools its event. A subagent gets the session's production
+// context, and a failed tool call is matched against production errors, both
+// from what session start saved, so neither waits on the network.
+async function localHook(lane, { input, hookEvent, config, agent, cwd, sessionExternalId, visible }) {
+  trackWatchedPrsCheaply(input, hookEvent, sessionExternalId, cwd);
+  const [event] = buildEvents(input, hookEvent, config, agent, null);
+  spoolEvent(sessionExternalId, event);
+  const meta = { sessionExternalId, cwd, agent, transcriptPath: input.transcript_path || null };
+  if (FLUSH_SETTING === "inline") await flushOnce(meta, { hookEvent, budgetMs: networkBudgetMs() });
+  else startSender(meta);
+
+  if (lane === "subagent") return subagentOutput(input, sessionExternalId, agent);
+  if (lane === "failure") return failureOutput(input, { sessionExternalId, agent, visible });
+  // A finished review the sender heard about is shown on the next tool call.
+  if (hookEvent === "PostToolUse" && !ASYNC_HOOK) {
+    const stash = readInboxStash(sessionExternalId);
+    if (stash) {
+      const context = { sessionExternalId, repo: stash.repo, agent, visible };
+      return mergeHookOutput(null, prInboxOutput({ inbox: stash.inbox }, hookEvent, input, context), hookEvent);
+    }
+  }
+  return null;
 }
 
 function readJsonFromStdin() {
@@ -322,6 +449,10 @@ function buildEvents(input, hookEvent, config, agent, head) {
       prompt: input.prompt || input.user_prompt || input.userPrompt || input.message,
       compact_summary: input.summary,
       result: input.tool_response || input.tool_result,
+      error: typeof input.error === "string" ? input.error.slice(0, 4_000) : undefined,
+      is_interrupt: input.is_interrupt === true ? true : undefined,
+      agent_type: input.agent_type,
+      reason: hookEvent === "SessionEnd" ? input.reason : undefined,
     }),
   };
   base.summary = summarizeHookEvent(base.payload, hookEvent);
@@ -428,7 +559,8 @@ function summarizeHookEvent(payload, hookEvent) {
   const p = payload || {};
   if (p.prompt) return sanitizeText(`User prompt: ${p.prompt}`, 700);
   if (p.compact_summary) return sanitizeText(`Compacted context: ${p.compact_summary}`, 700);
-  if (p.tool_name) return sanitizeText(`Tool used: ${p.tool_name}${p.tool_input?.command ? ` ${p.tool_input.command}` : ""}`, 700);
+  if (p.tool_name) return sanitizeText(`${hookEvent === "PostToolUseFailure" ? "Tool failed" : "Tool used"}: ${p.tool_name}${p.tool_input?.command ? ` ${p.tool_input.command}` : ""}`, 700);
+  if (hookEvent === "SubagentStart") return sanitizeText(`Subagent started: ${p.agent_type || "agent"}`, 200);
   return sanitizeText(String(hookEvent), 200);
 }
 
@@ -732,18 +864,12 @@ function sessionStartOutput(response, context) {
   const repoName = repoShort.split("/").pop() || repoShort;
 
   const risks = response?.activeRisks;
-  const riskCount = cleanCount(risks?.count);
   const top = (Array.isArray(risks?.top) ? risks.top : []).filter(isRecord).slice(0, 3).map(cleanRisk).filter((r) => r.title);
   const recent = (Array.isArray(risks?.recent) ? risks.recent : []).filter(isRecord).slice(0, 5).map(cleanRisk)
     .filter((r) => r.title && r.firstSeenMs != null);
-  if (riskCount >= 1 && top.length) {
-    contextLines.push(riskCount > top.length
-      ? `Open production risks (${riskCount}), top ${top.length}:`
-      : `Open production risks (${riskCount}):`);
-    top.forEach((r, i) => {
-      const tag = [r.severity || "unrated", r.environment].filter(Boolean).join(" ");
-      contextLines.push(`${i + 1}. [${tag}] ${r.title}`);
-    });
+  const riskLines = riskContextLines(risks);
+  if (riskLines.length) {
+    contextLines.push(...riskLines);
     howTo.push("if the task touches these areas, or the user asks about a prod symptom, check Libra first (libra_query, libra_list_risks, or /libra) because it may already have the trace.");
   }
 
@@ -765,7 +891,9 @@ function sessionStartOutput(response, context) {
     // Remembered by id, not by time: a risk is often confirmed hours after it
     // was first seen, and it is news when it is confirmed.
     const seen = isRecord(global.shownRisks) ? global.shownRisks : {};
-    shown = recent.filter((r) => !seen[r.key]);
+    // Claimed like the monitor's news, so a session start and the monitor's
+    // first tick, which run at the same moment, never both announce one risk.
+    shown = recent.filter((r) => !seen[r.key]).filter((r) => claimDelivery(`risk|${r.key}`));
     const queueDigest = JSON.stringify([context.repo, count]);
     const showQueue = count >= 1 && (global.lastQueueDigest !== queueDigest || now - Number(global.lastQueueShownAt || 0) >= STATUS_REPEAT_MS);
     intro = context.allowIntro ? introLineOnce() : null;
@@ -1165,39 +1293,45 @@ function pendingDir(sessionExternalId) {
 function queueSurfacedEvent(sessionExternalId, event) {
   try {
     const dir = pendingDir(sessionExternalId);
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const tmp = path.join(dir, `.queue-${process.pid}-${crypto.randomBytes(3).toString("hex")}.tmp`);
-    let ms = Date.now();
-    let lane = SURFACED_LANE_FIRST + crypto.randomInt(0, 40);
-    try {
-      for (let attempt = 0; attempt < 2_000; attempt += 1) {
-        const sequence = sequenceAt(ms, lane);
-        const final = path.join(dir, `${String(sequence).padStart(16, "0")}.json`);
-        fs.writeFileSync(tmp, JSON.stringify({ ...event, sequence }), { mode: 0o600 });
-        try {
-          // A hard link is atomic and fails if the name is taken, so two hooks
-          // can never claim the same sequence, and the file appears complete.
-          fs.linkSync(tmp, final);
-          break;
-        } catch (error) {
-          if (error?.code === "EEXIST") {
-            lane += 1;
-            if (lane > SURFACED_LANE_LAST) {
-              lane = SURFACED_LANE_FIRST;
-              ms += 1;
-            }
-            continue;
-          }
-          // No hard links on this filesystem: rename is still atomic, only not exclusive.
-          fs.renameSync(tmp, final);
-          break;
-        }
-      }
-    } finally {
-      unlinkQuiet(tmp);
-    }
+    writeQueuedEvent(dir, event, SURFACED_LANE_FIRST + crypto.randomInt(0, 40), SURFACED_LANE_FIRST, SURFACED_LANE_LAST);
     prunePendingSurfaced(dir);
   } catch {}
+}
+
+// One event, one file named by its sequence. The sequence is fixed here, so a
+// resend after a failure carries the same one and the server keeps one copy.
+function writeQueuedEvent(dir, event, startLane, laneFirst, laneLast) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const tmp = path.join(dir, `.queue-${process.pid}-${crypto.randomBytes(3).toString("hex")}.tmp`);
+  let ms = Date.now();
+  let lane = startLane;
+  try {
+    for (let attempt = 0; attempt < 2_000; attempt += 1) {
+      const sequence = sequenceAt(ms, lane);
+      const final = path.join(dir, `${String(sequence).padStart(16, "0")}.json`);
+      fs.writeFileSync(tmp, JSON.stringify({ ...event, sequence }), { mode: 0o600 });
+      try {
+        // A hard link is atomic and fails if the name is taken, so two hooks
+        // can never claim the same sequence, and the file appears complete.
+        fs.linkSync(tmp, final);
+        return;
+      } catch (error) {
+        if (error?.code === "EEXIST") {
+          lane += 1;
+          if (lane > laneLast) {
+            lane = laneFirst;
+            ms += 1;
+          }
+          continue;
+        }
+        // No hard links on this filesystem: rename is still atomic, only not exclusive.
+        fs.renameSync(tmp, final);
+        return;
+      }
+    }
+  } finally {
+    unlinkQuiet(tmp);
+  }
 }
 
 function pendingNames(dir) {
@@ -1249,6 +1383,557 @@ function ackPendingSurfaced(entries) {
 
 function unlinkQuiet(file) {
   try { fs.unlinkSync(file); } catch {}
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// One holder at a time: an exclusive create wins, and a lock whose holder
+// stopped refreshing it is taken over.
+function acquireFileLock(file, staleMs) {
+  const token = `${process.pid}:${Date.now()}:${crypto.randomBytes(3).toString("hex")}`;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    try {
+      fs.writeFileSync(file, token, { flag: "wx", mode: 0o600 });
+      return { file, token };
+    } catch (error) {
+      if (error?.code !== "EEXIST") return null;
+      if (Date.now() - fs.statSync(file).mtimeMs < staleMs) return null;
+      fs.writeFileSync(file, token, { mode: 0o600 });
+      return { file, token };
+    }
+  } catch {
+    return null;
+  }
+}
+
+function touchLock(lock) {
+  try { const now = new Date(); fs.utimesSync(lock.file, now, now); } catch {}
+}
+
+function releaseLock(lock) {
+  try { if (fs.readFileSync(lock.file, "utf8") === lock.token) fs.unlinkSync(lock.file); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Background sending: the spool and its sender.
+//
+// A hook that cannot answer writes its event to the session's spool (one file
+// per event, like a surfaced note) and makes sure a sender is running. The
+// sender is a detached process, so it outlives the hook and Claude Code's
+// 1.5-second SessionEnd budget. It waits a moment so a burst of tool calls
+// goes out as one batch, posts, deletes what the server accepted, and exits
+// after a few quiet seconds. Answering hooks also carry spooled events, so
+// nothing waits long for a sender.
+// ---------------------------------------------------------------------------
+
+function spoolDir(sessionExternalId) {
+  return path.join(stateDir(), `${hash(sessionExternalId)}.spool`);
+}
+
+function spoolEvent(sessionExternalId, event) {
+  try {
+    writeQueuedEvent(spoolDir(sessionExternalId), event, BATCH_LANE, 0, SURFACED_LANE_FIRST - 1);
+  } catch {}
+}
+
+// Oldest first. A spool that grew past its cap while the server was out of
+// reach keeps its newest events.
+function peekSpool(sessionExternalId, limit) {
+  const dir = spoolDir(sessionExternalId);
+  const names = pendingNames(dir);
+  if (!names.length) return [];
+  for (const name of names.slice(0, Math.max(0, names.length - MAX_SPOOL_FILES))) unlinkQuiet(path.join(dir, name));
+  const now = Date.now();
+  const entries = [];
+  for (const name of names.slice(Math.max(0, names.length - MAX_SPOOL_FILES))) {
+    if (entries.length >= limit) break;
+    const file = path.join(dir, name);
+    if (now - Number(name.slice(0, 16)) / SEQUENCE_SCALE > PENDING_MAX_AGE_MS) {
+      unlinkQuiet(file);
+      continue;
+    }
+    try {
+      const event = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (isRecord(event) && typeof event.type === "string") entries.push({ file, event });
+      else unlinkQuiet(file);
+    } catch {
+      unlinkQuiet(file);
+    }
+  }
+  return entries;
+}
+
+function cleanSpoolTemps(sessionExternalId) {
+  const dir = spoolDir(sessionExternalId);
+  const now = Date.now();
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.endsWith(".tmp")) continue;
+      const file = path.join(dir, name);
+      try { if (now - fs.statSync(file).mtimeMs > PENDING_TMP_MAX_AGE_MS) unlinkQuiet(file); } catch {}
+    }
+  } catch {}
+}
+
+function senderLockPath(sessionExternalId) {
+  return path.join(stateDir(), `${hash(sessionExternalId)}.sender`);
+}
+
+function startSender(meta) {
+  if (FLUSH_SETTING !== "background") return;
+  try {
+    try {
+      if (Date.now() - fs.statSync(senderLockPath(meta.sessionExternalId)).mtimeMs < FLUSH_LOCK_STALE_MS) return;
+    } catch {}
+    const child = spawn(process.execPath, [SCRIPT_PATH, "flush", Buffer.from(JSON.stringify(meta)).toString("base64url")], {
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env, LIBRA_HOOK_DELEGATED: "1" },
+    });
+    child.on("error", () => {});
+    child.unref();
+  } catch {}
+}
+
+async function runFlush() {
+  let meta = null;
+  try { meta = JSON.parse(Buffer.from(String(process.argv[3] || ""), "base64url").toString("utf8")); } catch {}
+  if (!isRecord(meta) || !meta.sessionExternalId) return;
+  meta.sessionExternalId = String(meta.sessionExternalId);
+  cleanSpoolTemps(meta.sessionExternalId);
+  // A second pass covers an event spooled in the moment between the last empty
+  // round and the lock's release, when its hook saw a live sender.
+  for (let pass = 0; pass < 2; pass += 1) {
+    const lock = acquireFileLock(senderLockPath(meta.sessionExternalId), FLUSH_LOCK_STALE_MS);
+    if (!lock) return;
+    let failed = false;
+    try {
+      if (FLUSH_DEBOUNCE_MS > 0) await sleepMs(FLUSH_DEBOUNCE_MS);
+      const deadline = Date.now() + FLUSH_MAX_MS;
+      let idle = 0;
+      while (Date.now() < deadline) {
+        touchLock(lock);
+        const result = await flushOnce(meta, { budgetMs: FLUSH_REQUEST_MS });
+        if (result.failed) {
+          failed = true;
+          break;
+        }
+        if (result.sent) idle = 0;
+        else if (++idle >= FLUSH_IDLE_ROUNDS) break;
+        await sleepMs(FLUSH_INTERVAL_MS);
+      }
+    } finally {
+      // A failed send keeps the lock until it ages out (see FLUSH_LOCK_STALE_MS).
+      if (!failed) releaseLock(lock);
+    }
+    if (failed || !peekSpool(meta.sessionExternalId, 1).length) return;
+  }
+}
+
+// One batch: spooled events, pending notes, and new transcript lines.
+async function flushOnce(meta, { budgetMs, hookEvent = "Background" } = {}) {
+  const sessionExternalId = String(meta.sessionExternalId);
+  const cwd = meta.cwd || process.cwd();
+  const agent = normalizeAgentName(meta.agent || "claude-code");
+  const config = readConfig(cwd);
+  if (config.enabled === false) return { sent: false };
+  const credentials = readCredentials();
+  if (!credentials.token) return { sent: false };
+  const spooled = peekSpool(sessionExternalId, MAX_SPOOL_PER_POST);
+  const pending = peekPendingSurfaced(sessionExternalId);
+  const transcriptPath = findTranscriptPath({ transcript_path: meta.transcriptPath }, agent, sessionExternalId);
+  const transcript = readTranscriptOnce(transcriptPath, sessionExternalId, config, agent);
+  if (!spooled.length && !pending.length && !transcript.length) return { sent: false };
+  const repoInfo = resolveRepoCached(cwd);
+  const branch = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
+  const head = git(["rev-parse", "HEAD"], cwd);
+  const items = [
+    ...spooled.map((entry) => ({ entry, event: withSourceHead(entry.event, head) })),
+    ...pending.map((entry) => ({ entry, event: entry.event })),
+    ...transcript.map((event) => ({ event })),
+  ].slice(0, MAX_EVENTS_PER_POST);
+  const watchedPrs = repoInfo.source === "local" ? [] : readWatchedPrs(sessionExternalId);
+  const response = await postJson(`${credentials.api}/developer-sessions/events`, credentials.token, {
+    sessionId: sessionExternalId,
+    repo: repoInfo.repo,
+    branch,
+    head,
+    client: agent,
+    cwd,
+    metadata: sessionMetadata({ agent, hookEvent, config, transcriptPath, repoInfo }),
+    events: items.map((item) => item.event),
+    ...(watchedPrs.length ? { watch: { prs: watchedPrs } } : {}),
+  }, budgetMs).catch(() => null);
+  if (!response) return { sent: false, failed: true };
+  ackPendingSurfaced(items.filter((item) => item.entry).map((item) => item.entry));
+  if (response.inbox) writeInboxStash(sessionExternalId, repoInfo.repo, response.inbox);
+  return { sent: true, response };
+}
+
+// New transcript lines, read by one process at a time.
+function readTranscriptOnce(transcriptPath, sessionExternalId, config, agent) {
+  if (!transcriptPath || (config.captureTranscript !== true && config.captureTranscript !== "summary")) return [];
+  const lock = acquireFileLock(path.join(stateDir(), `${hash(sessionExternalId)}.transcript-lock`), TRANSCRIPT_LOCK_STALE_MS);
+  if (!lock) return [];
+  try {
+    return config.captureTranscript === true
+      ? tailTranscriptEvents(transcriptPath, sessionExternalId, config, agent)
+      : tailTranscriptSummaries(transcriptPath, sessionExternalId, config, agent);
+  } finally {
+    releaseLock(lock);
+  }
+}
+
+// A remote lookup costs a git process; a tool call only needs it for `gh pr`.
+const REPO_CACHE_MS = 10 * 60_000;
+function resolveRepoCached(cwd) {
+  const file = path.join(stateDir(), `repo-${hash(path.resolve(cwd || "."))}.json`);
+  try {
+    const cached = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (isRecord(cached) && Date.now() - Number(cached.at) < REPO_CACHE_MS && typeof cached.repo === "string" && cached.repo
+      && ["origin", "remote", "local"].includes(cached.source)) return { repo: cached.repo, source: cached.source };
+  } catch {}
+  const info = resolveRepo(cwd);
+  try {
+    fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+    writeFileAtomic(file, JSON.stringify({ ...info, at: Date.now() }));
+  } catch {}
+  return info;
+}
+
+function trackWatchedPrsCheaply(input, hookEvent, sessionExternalId, cwd) {
+  if (hookEvent !== "PreToolUse" && hookEvent !== "PostToolUse") return;
+  if (String(input.tool_name || input.tool || "").toLowerCase() !== "bash") return;
+  const command = String(input.tool_input?.command ?? input.toolInput?.command ?? "");
+  if (!/\bgh\s+pr\b/.test(command)) return;
+  trackWatchedPrs(input, hookEvent, sessionExternalId, resolveRepoCached(cwd));
+}
+
+function inboxStashPath(sessionExternalId) {
+  return path.join(stateDir(), `${hash(sessionExternalId)}.inbox.json`);
+}
+
+function writeInboxStash(sessionExternalId, repo, inbox) {
+  try {
+    fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+    writeFileAtomic(inboxStashPath(sessionExternalId), JSON.stringify({ at: Date.now(), repo, inbox }));
+  } catch {}
+}
+
+function readInboxStash(sessionExternalId) {
+  try {
+    const stash = JSON.parse(fs.readFileSync(inboxStashPath(sessionExternalId), "utf8"));
+    if (!isRecord(stash) || Date.now() - Number(stash.at) > INBOX_STASH_MAX_AGE_MS) return null;
+    return { repo: String(stash.repo || ""), inbox: stash.inbox };
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// What session start learned, kept for hooks that answer locally: the
+// production risks a subagent should know about, and the production error
+// signatures a failed tool call is matched against. The monitor refreshes it.
+// ---------------------------------------------------------------------------
+
+function sessionContextPath(sessionExternalId) {
+  return path.join(stateDir(), `${hash(sessionExternalId)}.context.json`);
+}
+
+function writeSessionContext(sessionExternalId, repo, response) {
+  const risks = response?.activeRisks;
+  const top = (Array.isArray(risks?.top) ? risks.top : []).filter(isRecord).slice(0, 3).map(cleanRisk).filter((r) => r.title);
+  try {
+    fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+    writeFileAtomic(sessionContextPath(sessionExternalId), JSON.stringify({
+      at: Date.now(),
+      repo,
+      riskLines: riskContextLines(risks),
+      riskTitles: top.map((r) => r.title),
+      errorSignatures: cleanErrorSignatures(response?.errorSignatures),
+    }));
+  } catch {}
+}
+
+function readSessionContext(sessionExternalId) {
+  try {
+    const ctx = JSON.parse(fs.readFileSync(sessionContextPath(sessionExternalId), "utf8"));
+    if (!isRecord(ctx)) return null;
+    const strings = (list, max, n) => (Array.isArray(list) ? list : []).filter((v) => typeof v === "string").slice(0, n).map((v) => truncate(v, max));
+    return {
+      repo: String(ctx.repo || ""),
+      riskLines: strings(ctx.riskLines, 220, 4),
+      riskTitles: strings(ctx.riskTitles, 160, 3),
+      errorSignatures: cleanErrorSignatures(ctx.errorSignatures),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function riskContextLines(risks) {
+  const riskCount = cleanCount(risks?.count);
+  const top = (Array.isArray(risks?.top) ? risks.top : []).filter(isRecord).slice(0, 3).map(cleanRisk).filter((r) => r.title);
+  if (riskCount < 1 || !top.length) return [];
+  const lines = [riskCount > top.length ? `Open production risks (${riskCount}), top ${top.length}:` : `Open production risks (${riskCount}):`];
+  top.forEach((r, i) => {
+    const tag = [r.severity || "unrated", r.environment].filter(Boolean).join(" ");
+    lines.push(`${i + 1}. [${tag}] ${r.title}`);
+  });
+  return lines;
+}
+
+function cleanErrorSignatures(list) {
+  if (!Array.isArray(list)) return [];
+  return list.filter(isRecord).slice(0, MAX_ERROR_SIGNATURES).map((s) => ({
+    key: cleanField(s.key, 40, { label: true }),
+    environment: cleanField(s.environment, 20, { label: true }),
+    exceptionType: cleanField(s.exceptionType, 80, { label: true }),
+    signature: cleanField(s.signature, 200),
+    count: cleanCount(s.count),
+    firstSeenAt: timestampMs(s.firstSeenAt) != null ? s.firstSeenAt : null,
+    lastSeenAt: timestampMs(s.lastSeenAt) != null ? s.lastSeenAt : null,
+  })).filter((s) => s.key && (s.signature || s.exceptionType));
+}
+
+const SUBAGENT_SKIP_RE = /statusline|claude-code-guide/i;
+const SUBAGENT_HOW_TO = "if your task touches one of these areas, or you hit an error that looks like one of them, say so in your result so the main session can check Libra's production evidence (libra_query, libra_list_risks). Do not change course for them otherwise.";
+
+// A subagent starts with none of the session's context, so it gets the same
+// production picture the main session got at start. Claude only.
+function subagentOutput(input, sessionExternalId, agent) {
+  if (agent !== "claude-code") return null;
+  if (SUBAGENT_SKIP_RE.test(String(input.agent_type || ""))) return null;
+  const ctx = readSessionContext(sessionExternalId);
+  if (!ctx?.riskLines.length) return null;
+  recordSurfaced({ sessionExternalId, repo: ctx.repo, agent, visible: false }, { kind: "subagent_context", visibleText: "", titles: ctx.riskTitles });
+  return { hookSpecificOutput: { hookEventName: "SubagentStart", additionalContext: libraContext(ctx.repo, ctx.riskLines, SUBAGENT_HOW_TO) } };
+}
+
+const FAILURE_HOW_TO = "this local failure is an error Libra also sees in production. Tell the developer in one line, crediting Libra, because fixing it here may also fix it for production users. Do not assume production has the same cause: libra_query has the production traces.";
+
+// A failed tool call whose error text is one Libra has seen in production.
+// Matched locally against the signatures saved at session start, so a failure
+// never waits on the network; each production error is raised once a session.
+function failureOutput(input, { sessionExternalId, agent }) {
+  if (input.is_interrupt === true) return null;
+  const error = typeof input.error === "string" ? input.error : "";
+  if (error.length < 20) return null;
+  const ctx = readSessionContext(sessionExternalId);
+  if (!ctx?.errorSignatures.length) return null;
+  const fresh = matchErrorSignatures(error, ctx.errorSignatures)
+    .slice(0, 2)
+    .filter((match) => claimDelivery(`failure|${sessionExternalId}|${match.key}`));
+  if (!fresh.length) return null;
+  const now = Date.now();
+  const lines = fresh.map((m, i) => {
+    const what = m.signature || m.exceptionType;
+    const last = timestampMs(m.lastSeenAt);
+    const facts = [m.count ? `${m.count} occurrence${m.count === 1 ? "" : "s"}` : null, last != null ? `last seen ${ago(now - last)}` : null].filter(Boolean);
+    return `${i + 1}. [${m.environment || "production"}] ${what}${facts.length ? ` (${facts.join(", ")})` : ""}`;
+  });
+  lines.unshift("The tool call that just failed shows the same error as:");
+  recordSurfaced({ sessionExternalId, repo: ctx.repo, agent, visible: false }, { kind: "failure_match", visibleText: "", titles: fresh.map((m) => m.signature || m.exceptionType) });
+  return { hookSpecificOutput: { hookEventName: "PostToolUseFailure", additionalContext: libraContext(ctx.repo, lines, FAILURE_HOW_TO) } };
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// The server's message signature: lowercase, ids and digit runs collapsed to
+// '#' (error-family-producer.ts messageSignatureOf). Local output is put in the
+// same shape before matching.
+function normalizeErrorText(text) {
+  return String(text).slice(0, MAX_FAILURE_SCAN).toLowerCase()
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "#")
+    .replace(/[0-9a-f]{8,}/g, "#")
+    .replace(/[0-9]+/g, "#")
+    // Quoting differs between drivers and log formats; the words do not.
+    .replace(/["'`]/g, "")
+    .replace(/\s+/g, " ");
+}
+
+// A redacted value in a signature matches any one token of local output.
+function signaturePattern(signature) {
+  // Server signatures are already in this shape; normalizing again is a no-op
+  // for them and lets an unnormalized one (digits kept) match too.
+  const parts = normalizeErrorText(signature).split(/<redacted[^>]*>/);
+  if (parts.join("").replace(/[^a-z]/g, "").length < 16) return null;
+  try {
+    return new RegExp(parts.map((part) => escapeRegExp(part)).join("\\S{1,120}?"));
+  } catch {
+    return null;
+  }
+}
+
+function matchErrorSignatures(error, signatures) {
+  const text = normalizeErrorText(error);
+  const out = [];
+  const seen = new Set();
+  for (const sig of signatures) {
+    const label = sig.signature || sig.exceptionType;
+    if (seen.has(label)) continue;
+    let hit = false;
+    if (sig.signature) {
+      const re = signaturePattern(sig.signature);
+      hit = Boolean(re && re.test(text));
+    } else if (sig.exceptionType.length >= 10 && sig.exceptionType.includes("_")) {
+      hit = new RegExp(`(^|[^a-z0-9_])${escapeRegExp(sig.exceptionType.toLowerCase())}($|[^a-z0-9_])`).test(text);
+    }
+    if (hit) {
+      seen.add(label);
+      out.push(sig);
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// The session monitor (monitors/monitors.json). Claude Code runs a shell loop
+// for the whole interactive session that calls `monitor` once a minute; what
+// this prints reaches Claude as a notification, even while the session is
+// idle. It delivers a finished review of a watched PR and production risks
+// that became news while the developer works. Each tick is a fresh process, so
+// it always runs the newest installed copy.
+// ---------------------------------------------------------------------------
+
+function activityPath(sessionExternalId) {
+  return path.join(stateDir(), `${hash(sessionExternalId)}.activity`);
+}
+
+function activityMs(sessionExternalId) {
+  try { return fs.statSync(activityPath(sessionExternalId)).mtimeMs; } catch { return null; }
+}
+
+function claudePointerPath(pid) {
+  return path.join(stateDir(), `claude-${pid}.json`);
+}
+
+// The monitor's environment names the session it started in; after /clear the
+// session changes, so prompts record which session this Claude Code process is on.
+function noteSessionActivity(sessionExternalId, meta) {
+  try {
+    fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(activityPath(sessionExternalId), String(Date.now()), { mode: 0o600 });
+    const pid = Number(process.env.CLAUDE_PID || 0);
+    if (Number.isSafeInteger(pid) && pid > 1) {
+      writeFileAtomic(claudePointerPath(pid), JSON.stringify({ sessionId: sessionExternalId, cwd: meta.cwd, at: Date.now() }));
+    }
+  } catch {}
+}
+
+function monitorHeartbeatPath(sessionExternalId) {
+  return path.join(stateDir(), `${hash(sessionExternalId)}.monitor`);
+}
+
+function monitorAlive(sessionExternalId) {
+  try { return Date.now() - fs.statSync(monitorHeartbeatPath(sessionExternalId)).mtimeMs < MONITOR_ALIVE_MS; } catch { return false; }
+}
+
+function monitorStatePath(sessionExternalId) {
+  return path.join(stateDir(), `${hash(sessionExternalId)}.monitor-state.json`);
+}
+
+function markMonitorNewsChecked(sessionExternalId) {
+  try {
+    let state = {};
+    try { state = JSON.parse(fs.readFileSync(monitorStatePath(sessionExternalId), "utf8")) || {}; } catch {}
+    fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+    writeFileAtomic(monitorStatePath(sessionExternalId), JSON.stringify({ ...state, lastNewsAt: Date.now() }));
+  } catch {}
+}
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+async function runMonitorTick() {
+  const pid = Number(process.env.CLAUDE_PID || 0);
+  const hasPid = Number.isSafeInteger(pid) && pid > 1;
+  if (hasPid && !processAlive(pid)) process.exit(MONITOR_PARENT_GONE);
+  let pointer = null;
+  if (hasPid) {
+    try { pointer = JSON.parse(fs.readFileSync(claudePointerPath(pid), "utf8")); } catch {}
+  }
+  if (!isRecord(pointer)) pointer = {};
+  const sessionExternalId = String(pointer.sessionId || process.env.CLAUDE_CODE_SESSION_ID || "");
+  if (!sessionExternalId) return;
+  const cwd = typeof pointer.cwd === "string" && pointer.cwd ? pointer.cwd : process.cwd();
+  const config = readConfig(cwd);
+  if (config.enabled === false) return;
+  const credentials = readCredentials();
+  if (!credentials.token) return;
+  try {
+    fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(monitorHeartbeatPath(sessionExternalId), String(Date.now()), { mode: 0o600 });
+  } catch {}
+
+  const now = Date.now();
+  const watched = readWatchedPrs(sessionExternalId);
+  const statePath = monitorStatePath(sessionExternalId);
+  let state = {};
+  try { state = JSON.parse(fs.readFileSync(statePath, "utf8")) || {}; } catch {}
+  const lastActive = activityMs(sessionExternalId);
+  const newsDue = lastActive != null && now - lastActive < MONITOR_ACTIVE_MS && now - Number(state.lastNewsAt || 0) >= MONITOR_NEWS_INTERVAL_MS;
+  if (!watched.length && !newsDue) return;
+  const repoInfo = resolveRepoCached(cwd);
+  if (repoInfo.source === "local") return;
+  // Stamped before the request, so a server that is down is asked again in ten minutes, not every minute.
+  if (newsDue) {
+    try { writeFileAtomic(statePath, JSON.stringify({ ...state, lastNewsAt: now })); } catch {}
+  }
+  const response = await postJson(`${credentials.api}/developer-sessions/monitor`, credentials.token, {
+    sessionId: sessionExternalId,
+    repo: repoInfo.repo,
+    cwd,
+    client: "claude-code",
+    pluginVersion: PLUGIN_VERSION,
+    risks: newsDue,
+    ...(watched.length ? { watch: { prs: watched } } : {}),
+  }, MONITOR_REQUEST_MS).catch(() => null);
+  if (!response) return;
+
+  const context = { sessionExternalId, repo: repoInfo.repo, agent: "claude-code", visible: true };
+  if (newsDue && (response.activeRisks || response.errorSignatures)) writeSessionContext(sessionExternalId, repoInfo.repo, response);
+  const notes = [];
+  const review = wakeMessage(parseInbox(response), context, { kind: "pr_review_monitor", idle: false });
+  if (review) notes.push(review);
+  if (newsDue) {
+    const news = monitorNewsMessage(response, context);
+    if (news) notes.push(news);
+  }
+  if (!notes.length) return;
+  await new Promise((resolve) => process.stdout.write(`${notes.join("\n\n")}\n`, resolve));
+}
+
+// Production risks that became news since the developer last heard from
+// Libra, each told once on this machine, in whichever session asks first.
+function monitorNewsMessage(response, context) {
+  const recent = (Array.isArray(response?.activeRisks?.recent) ? response.activeRisks.recent : []).filter(isRecord).slice(0, 5).map(cleanRisk)
+    .filter((r) => r.title && r.firstSeenMs != null);
+  if (!recent.length) return null;
+  const now = Date.now();
+  const global = readGlobalState();
+  const seen = isRecord(global.shownRisks) ? global.shownRisks : {};
+  const fresh = recent.filter((r) => !seen[r.key]).filter((r) => claimDelivery(`risk|${r.key}`));
+  if (!fresh.length) return null;
+  patchGlobalState({ shownRisks: rememberShown(seen, fresh, now) });
+  const lines = ["New production risks Libra confirmed while you were working:"];
+  fresh.forEach((r, i) => {
+    const tag = [r.severity, r.environment].filter(Boolean).join(" ");
+    lines.push(`${i + 1}. [${tag}] ${r.title} (started ${ago(now - r.firstSeenMs)})`);
+  });
+  recordSurfaced(context, { kind: "monitor_news", visibleText: `New in production: ${fresh.map((r) => r.title).join("; ")}`, titles: fresh.map((r) => r.title) });
+  return libraContext(context.repo, lines, "tell the developer about each in one short line, crediting Libra, then go on with what you were doing. If one bears on the current task, say how. Do not start new work because of it.");
 }
 
 // ---------------------------------------------------------------------------
@@ -1687,6 +2372,8 @@ async function runWatch() {
   if (repoInfo.source === "local") return;
   const sessionExternalId = String(input.session_id || input.sessionId || process.env.CLAUDE_CODE_SESSION_ID || "");
   if (!sessionExternalId || !readWatchedPrs(sessionExternalId).length) return;
+  // The session monitor delivers reviews while the session runs, idle or not.
+  if (monitorAlive(sessionExternalId)) return;
   if (!versionAtLeast(claudeCodeVersion(input.transcript_path), MIN_ASYNC_REWAKE_VERSION)) return;
   const lock = acquireWatcherLock(sessionExternalId);
   if (!lock) return;
@@ -1727,26 +2414,30 @@ async function runWatch() {
 // The first finished review of a watched PR that no hook has shown yet. Taking
 // the review claim here keeps every other hook from showing it again, and the
 // stop claim keeps the Stop hook from raising it a second time.
-function wakeMessage(entries, context) {
+function wakeMessage(entries, context, { kind = "pr_review_wake", idle = true } = {}) {
   const repoKey = shortRepo(context.repo).toLowerCase();
   for (const entry of entries) {
     if (entry.state !== "reviewed") continue;
     if (!claimDelivery(`review|${repoKey}|${entry.prNumber}|${entry.runId}`)) continue;
     claimDelivery(`stop|${repoKey}|${entry.prNumber}|${entry.runId}`);
-    recordPrNote(context, "pr_review_wake", entry, "", [reviewTitle(entry)]);
+    recordPrNote(context, kind, entry, "", [reviewTitle(entry)]);
     const clean = !entry.issues.length && !entry.failureObserved;
     if (clean) {
       const score = entry.score != null ? ` (Confidence ${entry.score}/5)` : "";
       return libraContext(
         context.repo,
         [`Libra's finished review of PR #${entry.prNumber}${score}: no issues found in what Libra ran.`],
-        `Libra's review of PR #${entry.prNumber} finished while the session was idle. Tell the developer in one short line that it came back clean${score}, crediting Libra. Do not start any other work.`,
+        idle
+          ? `Libra's review of PR #${entry.prNumber} finished while the session was idle. Tell the developer in one short line that it came back clean${score}, crediting Libra. Do not start any other work.`
+          : `Libra's review of PR #${entry.prNumber} finished. Tell the developer in one short line that it came back clean${score}, crediting Libra, then go on with what you were doing.`,
       );
     }
     return libraContext(
       context.repo,
       reviewContextLines(entry, 1).lines,
-      "Libra's review of this PR finished while the session was idle. Tell the developer about it briefly, using the shape below, and ask whether they want the issues fixed. Do not change any code until they say yes.",
+      idle
+        ? "Libra's review of this PR finished while the session was idle. Tell the developer about it briefly, using the shape below, and ask whether they want the issues fixed. Do not change any code until they say yes."
+        : "Libra's review of this PR finished. When you reach a stopping point, tell the developer about it briefly, using the shape below, and ask whether they want the issues fixed. Do not change any code for it until they say yes.",
     );
   }
   return null;
@@ -1788,30 +2479,15 @@ function watcherLockPath(sessionExternalId) {
 // One watcher per session: an exclusive create wins, and a lock whose owner
 // stopped refreshing it is taken over.
 function acquireWatcherLock(sessionExternalId) {
-  const file = watcherLockPath(sessionExternalId);
-  const token = `${process.pid}:${Date.now()}`;
-  try {
-    fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
-    try {
-      fs.writeFileSync(file, token, { flag: "wx", mode: 0o600 });
-      return { file, token };
-    } catch (error) {
-      if (error?.code !== "EEXIST") return null;
-      if (Date.now() - fs.statSync(file).mtimeMs < WATCH_LOCK_STALE_MS) return null;
-      fs.writeFileSync(file, token, { mode: 0o600 });
-      return { file, token };
-    }
-  } catch {
-    return null;
-  }
+  return acquireFileLock(watcherLockPath(sessionExternalId), WATCH_LOCK_STALE_MS);
 }
 
 function touchWatcherLock(lock) {
-  try { const now = new Date(); fs.utimesSync(lock.file, now, now); } catch {}
+  touchLock(lock);
 }
 
 function releaseWatcherLock(lock) {
-  try { if (fs.readFileSync(lock.file, "utf8") === lock.token) fs.unlinkSync(lock.file); } catch {}
+  releaseLock(lock);
 }
 
 function prInboxOutput(response, hookEvent, input, context) {

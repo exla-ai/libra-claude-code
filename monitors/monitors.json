@@ -1,0 +1,7 @@
+[
+  {
+    "name": "libra",
+    "command": "while :; do node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" monitor; [ $? -eq 3 ] && break; sleep 60; done",
+    "description": "Libra: new production risks and finished PR reviews"
+  }
+]

@@ -14,17 +14,39 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" claude-code", "timeout": 10 }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" claude-code", "timeout": 10 }
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" claude-code async", "async": true, "timeout": 30 }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" claude-code", "timeout": 5 }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" claude-code", "timeout": 5 }
         ]
       }
     ],
     "PostCompact": [
       {
         "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" claude-code", "timeout": 10 }
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" claude-code async", "async": true, "timeout": 30 }
         ]
       }
     ],
@@ -39,15 +61,7 @@
     "SessionEnd": [
       {
         "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" claude-code", "timeout": 10 }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" claude-code", "timeout": 10 }
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs\" claude-code", "timeout": 5 }
         ]
       }
     ]
