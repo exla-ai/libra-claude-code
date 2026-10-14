@@ -301,15 +301,18 @@ versions, which may not run hooks in the background.
 Libra once a minute. While the session watches a PR it delivers the finished review
 as soon as it lands, mid-turn or idle, so the Stop watcher above stands down while
 the monitor runs. While you are active (a prompt in the last two hours) it also asks,
-at most every ten minutes, for production risks that became news, and tells Claude
-about each once on this machine. A window left open for days makes no requests. Each
+at most every ten minutes, for production problems that became news. It never tells
+them mid-task: it holds them until you are done (Claude finished a turn that committed,
+pushed, or opened a PR, or Claude finished and you have not typed for 10 minutes),
+then tells Claude about each once on this machine, as what was observed and its
+measured impact. A window left open for days makes no requests. Each
 tick is a fresh process, so it always runs the newest installed copy, and it ends
 when Claude Code exits.
 
 What the plugin sends for this: the PR numbers it noticed (`watch.prs`) with each
 event batch. A repo with no GitHub remote has no PRs to watch. Each block shown is
 recorded as a `libra_surfaced` note (`pr_watch`, `pr_review`, `pr_review_stop`, `pr_review_wake`,
-`pr_review_monitor`, `monitor_news`) with the PR number and run id.
+`pr_review_monitor`, `monitor_news`, `held_news`) with the PR number and run id.
 
 ## Subagents and failing commands (Claude only)
 

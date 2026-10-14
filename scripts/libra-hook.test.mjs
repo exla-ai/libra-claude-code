@@ -12,13 +12,14 @@ const HOOK = path.join(ROOT, "scripts", "libra-hook.mjs");
 // The server writes every note the plugin shows. Fixtures stay in the server's
 // input shape (risk rows, review queue, prompt matches), and the harness turns
 // them into notes with the real server code, so these tests run the whole path.
-const { sessionStartNotes, monitorNotes, promptMatchNotes } = await import(path.join(ROOT, "..", "api", "src", "services", "coding-agent-notes.ts"));
+const { sessionStartNotes, monitorNotes, promptMatchNotes, pluginCanHoldNotes } = await import(path.join(ROOT, "..", "api", "src", "services", "coding-agent-notes.ts"));
+const { measuredNoteFromRow } = await import(path.join(ROOT, "..", "api", "src", "services", "coding-agent-production-notes.ts"));
 
 function withServerNotes(url, request, reply) {
   if (!reply || typeof reply !== "object" || Object.hasOwn(reply, "notes")) return reply;
   const repo = String(request.repo || "acme/app");
   if (url.includes("/developer-sessions/monitor")) {
-    return reply.activeRisks ? { ...reply, notes: monitorNotes({ repo, risks: reply.activeRisks }) } : reply;
+    return reply.activeRisks ? { ...reply, notes: monitorNotes({ repo, risks: reply.activeRisks, canHold: pluginCanHoldNotes(request.pluginVersion) }) } : reply;
   }
   const hookEvent = request.metadata?.hookEvent;
   if (hookEvent === "SessionStart") return { ...reply, notes: sessionStartNotes({ repo, risks: reply.activeRisks, reviewQueue: reply.reviewQueue }) };
@@ -300,7 +301,7 @@ test("SessionStart shows the developer only production risks that are new to the
     for (const sessionId of ["sess-a", "sess-c", "sess-e"]) {
       await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUse", session_id: sessionId, cwd: repo, tool_name: "Read" } });
     }
-    assert.equal(requests.at(-1).body.metadata.pluginVersion, "0.6.1");
+    assert.equal(requests.at(-1).body.metadata.pluginVersion, "0.7.0");
     const surfaced = requests.flatMap((r) => r.body.events || []).filter((e) => e.type === "libra_surfaced" && e.payload.kind === "session_start");
     const intro = surfaced.filter((e) => e.payload.introShown);
     assert.equal(intro.length, 1);
@@ -2030,7 +2031,7 @@ test("A tool call records locally and returns at once; a background sender posts
     assert.equal(sent.length, 6, "every tool event reached the server");
     assert.ok(requests.length <= 3, `a burst goes out in a few batches, not one per hook: ${requests.length}`);
     assert.ok(sent.every((e) => /^[0-9a-f]{40}$/.test(e.sourceHead || "") || e.sourceHead === null), "the sender stamps the head it sees");
-    assert.equal(requests[0].body.metadata.pluginVersion, "0.6.1");
+    assert.equal(requests[0].body.metadata.pluginVersion, "0.7.0");
   });
 });
 
@@ -2366,7 +2367,7 @@ test("an investigation Libra starts from the developer's own prompt is polled wi
   });
 });
 
-test("The monitor asks nothing of an idle session, and tells an active one about new production risks once", async () => {
+test("The monitor asks nothing of an idle session, and holds news for an active one until the developer is done", async () => {
   const repo = makeRepo();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
   const sid = "sess-mon";
@@ -2387,9 +2388,22 @@ test("The monitor asks nothing of an idle session, and tells an active one about
     const monitorCall = requests.find((r) => r.url === MONITOR);
     assert.equal(monitorCall.body.risks, true);
     assert.equal(monitorCall.body.sessionId, sid);
-    assertContextBlock(tick.stdout.trim(), { numbered: false });
-    assert.match(tick.stdout, /New production risks Libra confirmed while you were working:\n- \[P2 prod\] Mail views fail to load after reconnect \(started \d+m ago\)/);
-    assert.match(tick.stdout, /How to use this: tell the developer about each in one short line, crediting Libra/);
+    assert.equal(tick.stdout, "", "Claude is mid-turn: the news is held, not told");
+    // Long idle is not enough while Claude is still working on the prompt.
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid, env: { LIBRA_HOOK_HELD_IDLE_MS: "1" } })).stdout, "");
+    // A turn that ends without shipping anything is not done either, until the developer is away.
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "Stop", session_id: sid, cwd: repo } });
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", "a turn ended, but the developer is still on it");
+    // The developer commits, and the turn ends: done.
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "UserPromptSubmit", session_id: sid, cwd: repo, prompt: "commit it" } });
+    await runHook({ api, home, cwd: repo, env: { LIBRA_HOOK_FLUSH: "off" }, input: { hook_event_name: "PostToolUse", session_id: sid, cwd: repo, tool_name: "Bash", tool_input: { command: "git commit -m 'retry the loader'" } } });
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", "committed, but Claude has not finished the turn");
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "Stop", session_id: sid, cwd: repo } });
+    const done = await runMonitor({ api, home, cwd: repo, sid });
+    assertContextBlock(done.stdout.trim(), { numbered: false });
+    assert.match(done.stdout, /What Libra observed in production, and its measured impact:\n- \[P2 prod\] Mail views fail to load after reconnect \(started \d+m ago\)/);
+    assert.match(done.stdout, /How to use this: the developer just finished what they were working on/);
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", "told once");
 
     const calls = requests.filter((r) => r.url === MONITOR).length;
     assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", "news is asked for at most every ten minutes");
@@ -2403,6 +2417,41 @@ test("The monitor asks nothing of an idle session, and tells an active one about
     const start = await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionStart", source: "startup", session_id: "sess-mon-2", cwd: repo } });
     assert.doesNotMatch(start.stdout, /Mail views fail/);
   });
+});
+
+test("Session start shows what was observed and its measured impact", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const at = new Date(Date.now() - 2 * HOUR).toISOString();
+  const crash = measuredNoteFromRow({ id: "cand-crash", kind: "ecs_crash_pattern", title: "x", last_seen_at: at, real: 1, evidence_json: JSON.stringify({
+    service: "aws-prod-worker-service", windowDays: 7, crashes: 3, crashesLast24h: 3, signatures: [{ signature: "Error: write EPIPE", count: 3, lastAt: at }],
+  }) });
+  await withApi({ [EVENTS]: (body) => ({ ok: true, notes: sessionStartNotes({ repo: body.repo, measured: [crash] }) }) }, async (api) => {
+    const out = await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionStart", source: "startup", session_id: "sess-measured", cwd: repo } });
+    const shown = JSON.parse(out.stdout).systemMessage;
+    assert.match(shown, /aws-prod-worker-service tasks crashed 3 times in 7 days, 3 in the last 24h/);
+    assert.match(shown, /\n {4}Impact: Each crash restarted a task and stopped the work running on it\. Last seen 2h ago\./);
+    assert.doesNotMatch(shown, /users|customers|P[0-3]\b/);
+  });
+});
+
+test("Held news is told once the developer has been away after Claude finished", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-held-idle";
+  await withApi({ [MONITOR]: () => ({ ok: true, activeRisks: NEWS }), [EVENTS]: () => ({ ok: true }) }, async (api) => {
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "UserPromptSubmit", session_id: sid, cwd: repo, prompt: "look at the mail view loader" } });
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "");
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "Stop", session_id: sid, cwd: repo } });
+    // No news request this tick (asked less than ten minutes ago); the held news is released from disk.
+    const away = await runMonitor({ api, home, cwd: repo, sid, env: { LIBRA_HOOK_HELD_IDLE_MS: "1" } });
+    assert.match(away.stdout, /Mail views fail to load after reconnect/);
+  });
+});
+
+test("An older plugin's monitor gets no news at all, so nothing interrupts it", () => {
+  const blocks = monitorNotes({ repo: "acme/app", risks: NEWS, canHold: pluginCanHoldNotes("0.6.1") });
+  assert.equal(blocks.some((b) => b.key === "news"), false);
 });
 
 test("The monitor delivers a finished review of a watched PR once, and the Stop watcher stands down for it", async () => {

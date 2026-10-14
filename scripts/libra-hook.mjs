@@ -12,7 +12,7 @@ const MAX_EVENTS_PER_POST = 50;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "0.6.1";
+const PLUGIN_VERSION = "0.7.0";
 const MAX_PENDING_SURFACED = 10;
 // Fast updates (see runNewestInstalledCopy): where this copy lives, how often
 // a hook may ask Claude Code to refresh the plugin, and the size cap for
@@ -69,6 +69,12 @@ const MONITOR_REQUEST_MS = 8_000;
 const MONITOR_ALIVE_MS = 3 * 60_000;
 // Exit code that ends the monitor's shell loop: the Claude Code process is gone.
 const MONITOR_PARENT_GONE = 3;
+// News the server marks holdUntilDone waits until the developer is done with
+// what they were doing: Claude finished a turn that committed, pushed, or
+// opened a PR, or Claude finished and the developer has not typed for this long.
+const HELD_IDLE_MS = Number(process.env.LIBRA_HOOK_HELD_IDLE_MS) || 10 * 60_000;
+const HELD_MAX_AGE_MS = 24 * 60 * 60_000;
+const SHIP_COMMAND = /\bgit\s+(?:commit|push)\b|\bgh\s+pr\s+(?:create|merge|ready)\b/;
 const MAX_ERROR_SIGNATURES = 80;
 const MAX_FAILURE_SCAN = 20_000;
 // Background review watcher (Stop, async + asyncRewake in hooks.json). PR
@@ -231,6 +237,8 @@ async function main() {
   const hookEvent = String(input.hook_event_name || input.hookEventName || input.event || "event");
   const visible = agent === "claude-code";
 
+  // When Claude last finished a turn: held news waits for the developer to be done.
+  if (hookEvent === "Stop") markSessionMoment(sessionExternalId, "stopped");
   // Hooks that cannot answer record their event locally and return at once.
   const lane = hookLane(hookEvent, input);
   if (lane !== "answer") {
@@ -367,6 +375,10 @@ function withSourceHead(event, head) {
 // from what session start saved, so neither waits on the network.
 async function localHook(lane, { input, hookEvent, config, agent, cwd, sessionExternalId, visible }) {
   trackWatchedPrsCheaply(input, hookEvent, sessionExternalId, cwd);
+  if (hookEvent === "PostToolUse" && String(input.tool_name || input.tool || "").toLowerCase() === "bash"
+    && SHIP_COMMAND.test(String(input.tool_input?.command ?? input.toolInput?.command ?? ""))) {
+    markSessionMoment(sessionExternalId, "shipped");
+  }
   trackInvestigations(input, hookEvent, sessionExternalId);
   const [event] = buildEvents(input, hookEvent, config, agent, null);
   spoolEvent(sessionExternalId, event);
@@ -888,6 +900,7 @@ function cleanNoteItem(item) {
     legacyRiskIds: noteIds(item.legacyRiskIds, 80),
     requiresLegacyRiskIds: noteIds(item.requiresLegacyRiskIds, 80),
     line: cleanField(item.line, MAX_VISIBLE_LINE - 4),
+    detail: cleanField(item.detail, MAX_VISIBLE_LINE - 6),
     context: noteLines(item.context),
     title: cleanField(item.title, 200),
   };
@@ -909,6 +922,7 @@ function cleanNoteBlocks(notes) {
     expiresAt: timestampMs(block.expiresAt),
     titles: (Array.isArray(block.titles) ? block.titles : []).map((t) => cleanField(t, 160)).filter(Boolean).slice(0, 3),
     feedbackAsk: block.feedbackAsk === true,
+    holdUntilDone: block.holdUntilDone === true,
     joinedLine: cleanField(block.joinedLine, MAX_VISIBLE_LINE - 4),
     items: (Array.isArray(block.items) ? block.items : []).filter(isRecord).slice(0, MAX_NOTE_ITEMS).map(cleanNoteItem),
   }));
@@ -973,7 +987,7 @@ function renderNotes(blocks, { surface, visible }) {
     let isVisible = false;
     if (visible && block.header && fresh.length) {
       const listed = shown.length > block.maxVisible ? shown.slice(0, block.maxVisible - 1) : shown;
-      const bullets = listed.map((item) => `  - ${item.line}`);
+      const bullets = listed.flatMap((item) => item.detail ? [`  - ${item.line}`, `    ${item.detail}`] : [`  - ${item.line}`]);
       if (shown.length > listed.length) bullets.push(`  - +${shown.length - listed.length} more`);
       parts.push({ header: block.header, bullets, footer: block.footer && shown.length ? block.footer : "", joinedLine: block.joinedLine });
       isVisible = true;
@@ -1960,6 +1974,68 @@ function markMonitorNewsChecked(sessionExternalId) {
   } catch {}
 }
 
+// Moments that say whether the developer is done: when Claude last finished a
+// turn ("stopped") and when a commit, push, or PR command last ran ("shipped").
+// The last prompt is the activity file.
+function sessionMomentPath(sessionExternalId, name) {
+  return path.join(stateDir(), `${hash(sessionExternalId)}.${name}`);
+}
+
+function markSessionMoment(sessionExternalId, name) {
+  try {
+    fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(sessionMomentPath(sessionExternalId, name), String(Date.now()), { mode: 0o600 });
+  } catch {}
+}
+
+function sessionMomentMs(sessionExternalId, name) {
+  try { return fs.statSync(sessionMomentPath(sessionExternalId, name)).mtimeMs; } catch { return null; }
+}
+
+// Done: Claude is not mid-turn (it finished after the last prompt), and either
+// that turn shipped something or the developer has been away for a while.
+// Never while Claude is working, so a note cannot land in the middle of a fix.
+function sessionIsDone(sessionExternalId, now) {
+  const stopped = sessionMomentMs(sessionExternalId, "stopped");
+  if (stopped == null) return false;
+  const prompted = activityMs(sessionExternalId) ?? 0;
+  if (stopped < prompted) return false;
+  const shipped = sessionMomentMs(sessionExternalId, "shipped");
+  return (shipped != null && shipped >= prompted) || now - stopped >= HELD_IDLE_MS;
+}
+
+function heldNotesPath(sessionExternalId) {
+  return path.join(stateDir(), `${hash(sessionExternalId)}.held.json`);
+}
+
+function storeHeldNotes(sessionExternalId, repo, notes) {
+  try {
+    fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+    writeFileAtomic(heldNotesPath(sessionExternalId), JSON.stringify({ at: Date.now(), repo, notes }));
+  } catch {}
+}
+
+// Tells what was held, once the developer is done. The file goes once it is
+// told; what was already shown elsewhere is skipped by the usual once-claims.
+function releaseHeldNotes(sessionExternalId, now) {
+  let held = null;
+  try { held = JSON.parse(fs.readFileSync(heldNotesPath(sessionExternalId), "utf8")); } catch { return null; }
+  if (!isRecord(held) || !(now - Number(held.at || 0) < HELD_MAX_AGE_MS)) {
+    unlinkQuiet(heldNotesPath(sessionExternalId));
+    return null;
+  }
+  if (!sessionIsDone(sessionExternalId, now)) return null;
+  unlinkQuiet(heldNotesPath(sessionExternalId));
+  const blocks = cleanNoteBlocks(held.notes);
+  if (!blocks?.length) return null;
+  const repo = String(held.repo || "");
+  const rendered = renderNotes(blocks, { surface: "monitor", visible: false });
+  if (!rendered.contextLines.length) return null;
+  const context = { sessionExternalId, repo, agent: "claude-code", visible: true };
+  for (const note of rendered.surfaced) recordSurfaced(context, { ...note, kind: "held_news" });
+  return libraContext(repo, rendered.contextLines, rendered.howTo);
+}
+
 function processAlive(pid) {
   try {
     process.kill(pid, 0);
@@ -1998,7 +2074,11 @@ async function runMonitorTick() {
   const lastActive = activityMs(sessionExternalId);
   const newsDue = lastActive != null && now - lastActive < MONITOR_ACTIVE_MS && now - Number(state.lastNewsAt || 0) >= MONITOR_NEWS_INTERVAL_MS;
   const investigations = readInvestigations(sessionExternalId);
-  if (!watched.length && !newsDue && !investigations.length) return;
+  if (!watched.length && !newsDue && !investigations.length) {
+    const held = releaseHeldNotes(sessionExternalId, now);
+    if (held) await new Promise((resolve) => process.stdout.write(`${held}\n`, resolve));
+    return;
+  }
   const repoInfo = resolveRepoCached(cwd);
   if (repoInfo.source === "local") return;
   // Stamped before the request, so a server that is down is asked again in ten minutes, not every minute.
@@ -2037,6 +2117,8 @@ async function runMonitorTick() {
     const news = monitorNewsMessage(response, context);
     if (news) notes.push(news);
   }
+  const held = releaseHeldNotes(sessionExternalId, Date.now());
+  if (held) notes.push(held);
   if (!notes.length) return;
   await new Promise((resolve) => process.stdout.write(`${notes.join("\n\n")}\n`, resolve));
 }
@@ -2044,8 +2126,16 @@ async function runMonitorTick() {
 // Production risks that became news since the developer last heard from
 // Libra, each told once on this machine, in whichever session asks first.
 function monitorNewsMessage(response, context) {
-  const blocks = cleanNoteBlocks(response?.notes);
-  if (!blocks?.length) return null;
+  const all = cleanNoteBlocks(response?.notes);
+  if (!all?.length) return null;
+  // News that would interrupt is kept, as the server wrote it, until the
+  // developer is done; the latest answer replaces what was held, and anything
+  // already told is still told once.
+  const raw = Array.isArray(response.notes) ? response.notes.filter(isRecord).slice(0, MAX_NOTE_BLOCKS) : [];
+  const heldRaw = raw.filter((block) => block.holdUntilDone === true);
+  if (heldRaw.length) storeHeldNotes(context.sessionExternalId, context.repo, heldRaw);
+  const blocks = all.filter((block) => !block.holdUntilDone);
+  if (!blocks.length) return null;
   const rendered = renderNotes(blocks, { surface: "monitor", visible: false });
   if (!rendered.contextLines.length) return null;
   for (const note of rendered.surfaced) recordSurfaced(context, note);
