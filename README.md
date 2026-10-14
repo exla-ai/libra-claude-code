@@ -138,6 +138,11 @@ an investigation is pending the monitor checks every minute instead of every ten
 chaining Libra reads in the developer's thread. `libra_investigation <id>` fetches
 an answer directly.
 
+From 0.6.1 nobody has to call it: when the developer's own prompt is a production
+question, Libra starts the investigation from the prompt hook and the plugin polls
+for the answer the same way. A request that turns out not to be about production
+is dropped without a note.
+
 ## Speed: only answering hooks wait
 
 Only the hooks whose answer depends on Libra wait for the network: session start,

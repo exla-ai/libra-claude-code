@@ -12,7 +12,7 @@ const MAX_EVENTS_PER_POST = 50;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "0.6.0";
+const PLUGIN_VERSION = "0.6.1";
 const MAX_PENDING_SURFACED = 10;
 // Fast updates (see runNewestInstalledCopy): where this copy lives, how often
 // a hook may ask Claude Code to refresh the plugin, and the size cap for
@@ -304,6 +304,9 @@ async function main() {
     ackPendingSurfaced(pending.filter((entry) => sent.has(entry.event)));
     ackPendingSurfaced(spooledItems.filter((item) => sent.has(item.event)).map((item) => item.entry));
     if (response.inbox) writeInboxStash(sessionExternalId, repoInfo.repo, response.inbox);
+    if (Array.isArray(response.investigations)) {
+      rememberInvestigations(sessionExternalId, response.investigations.map((inv) => inv?.id));
+    }
   }
   if (peekSpool(sessionExternalId, 1).length) startSender({ sessionExternalId, cwd, agent, transcriptPath: input.transcript_path || null });
 
@@ -1681,11 +1684,19 @@ function trackInvestigations(input, hookEvent, sessionExternalId) {
     if (hookEvent !== "PostToolUse") return;
     if (!/(?:^|__)libra_investigate$/i.test(String(input.tool_name || ""))) return;
     const text = JSON.stringify(input.tool_response ?? input.toolResponse ?? "").slice(0, 20_000);
-    const ids = [...new Set(text.match(INVESTIGATION_ID_RE) || [])].slice(0, 3);
-    if (!ids.length) return;
+    rememberInvestigations(sessionExternalId, text.match(INVESTIGATION_ID_RE) || []);
+  } catch {}
+}
+
+// Libra also starts investigations by itself from a production question in the
+// developer's prompt; the prompt response names them.
+function rememberInvestigations(sessionExternalId, ids) {
+  try {
+    const valid = [...new Set(ids.map(String).filter((id) => /^inv_[a-f0-9]{20}$/.test(id)))].slice(0, 3);
+    if (!valid.length) return;
     const dir = investigationDir(sessionExternalId);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    for (const id of ids) writeFileAtomic(path.join(dir, `${id}.json`), JSON.stringify({ id, seenAt: Date.now() }));
+    for (const id of valid) writeFileAtomic(path.join(dir, `${id}.json`), JSON.stringify({ id, seenAt: Date.now() }));
   } catch {}
 }
 

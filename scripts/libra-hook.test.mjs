@@ -300,7 +300,7 @@ test("SessionStart shows the developer only production risks that are new to the
     for (const sessionId of ["sess-a", "sess-c", "sess-e"]) {
       await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUse", session_id: sessionId, cwd: repo, tool_name: "Read" } });
     }
-    assert.equal(requests.at(-1).body.metadata.pluginVersion, "0.6.0");
+    assert.equal(requests.at(-1).body.metadata.pluginVersion, "0.6.1");
     const surfaced = requests.flatMap((r) => r.body.events || []).filter((e) => e.type === "libra_surfaced" && e.payload.kind === "session_start");
     const intro = surfaced.filter((e) => e.payload.introShown);
     assert.equal(intro.length, 1);
@@ -2030,7 +2030,7 @@ test("A tool call records locally and returns at once; a background sender posts
     assert.equal(sent.length, 6, "every tool event reached the server");
     assert.ok(requests.length <= 3, `a burst goes out in a few batches, not one per hook: ${requests.length}`);
     assert.ok(sent.every((e) => /^[0-9a-f]{40}$/.test(e.sourceHead || "") || e.sourceHead === null), "the sender stamps the head it sees");
-    assert.equal(requests[0].body.metadata.pluginVersion, "0.6.0");
+    assert.equal(requests[0].body.metadata.pluginVersion, "0.6.1");
   });
 });
 
@@ -2344,6 +2344,25 @@ test("an investigation Libra runs server-side reaches the session within a minut
     const before = requests.filter((r) => r.url === MONITOR).length;
     assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", "told once, and no longer watched");
     assert.equal(requests.filter((r) => r.url === MONITOR).length, before, "a finished investigation stops the polling");
+  });
+});
+
+test("an investigation Libra starts from the developer's own prompt is polled without libra_investigate", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const sid = "sess-auto-investigate";
+  const id = "inv_" + "d".repeat(20);
+  await withApi({
+    [EVENTS]: () => ({ ok: true, investigations: [{ id, status: "queued" }] }),
+    [MONITOR]: () => ({ ok: true, investigations: [{ id, status: "running" }], notes: [] }),
+  }, async (api, requests) => {
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "UserPromptSubmit", session_id: sid, cwd: repo, prompt: "is the clari and zoom issue still happening?" } });
+    const statePath = path.join(home, ".config/libra/coding-agent", `${sessionHash(sid)}.monitor-state.json`);
+    fs.writeFileSync(statePath, JSON.stringify({ lastNewsAt: Date.now() }));
+    await runMonitor({ api, home, cwd: repo, sid });
+    const asked = requests.filter((r) => r.url === MONITOR);
+    assert.equal(asked.length, 1, "the pending investigation makes the monitor ask within a minute");
+    assert.deepEqual(asked[0].body.watch, { investigations: [id] });
   });
 });
 
