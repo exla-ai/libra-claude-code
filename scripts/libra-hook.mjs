@@ -12,7 +12,7 @@ const MAX_EVENTS_PER_POST = 50;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "0.7.0";
+const PLUGIN_VERSION = "0.7.1";
 const MAX_PENDING_SURFACED = 10;
 // Fast updates (see runNewestInstalledCopy): where this copy lives, how often
 // a hook may ask Claude Code to refresh the plugin, and the size cap for
@@ -2111,8 +2111,12 @@ async function runMonitorTick() {
   // the cached context stays.
   if (newsDue && Array.isArray(response.notes)) writeSessionContext(sessionExternalId, repoInfo.repo, response);
   const notes = [];
-  const review = wakeMessage(parseInbox(response), context, { kind: "pr_review_monitor", idle: false });
-  if (review) notes.push(review);
+  // A finished review, clean or not, waits like held news until the developer
+  // is done; unclaimed, so a later tick (or the Stop hook) tells it then.
+  if (sessionIsDone(sessionExternalId, Date.now())) {
+    const review = wakeMessage(parseInbox(response), context, { kind: "pr_review_monitor", idle: true });
+    if (review) notes.push(review);
+  }
   if (newsDue || investigations.length) {
     const news = monitorNewsMessage(response, context);
     if (news) notes.push(news);

@@ -301,7 +301,7 @@ test("SessionStart shows the developer only production risks that are new to the
     for (const sessionId of ["sess-a", "sess-c", "sess-e"]) {
       await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUse", session_id: sessionId, cwd: repo, tool_name: "Read" } });
     }
-    assert.equal(requests.at(-1).body.metadata.pluginVersion, "0.7.0");
+    assert.equal(requests.at(-1).body.metadata.pluginVersion, "0.7.1");
     const surfaced = requests.flatMap((r) => r.body.events || []).filter((e) => e.type === "libra_surfaced" && e.payload.kind === "session_start");
     const intro = surfaced.filter((e) => e.payload.introShown);
     assert.equal(intro.length, 1);
@@ -2031,7 +2031,7 @@ test("A tool call records locally and returns at once; a background sender posts
     assert.equal(sent.length, 6, "every tool event reached the server");
     assert.ok(requests.length <= 3, `a burst goes out in a few batches, not one per hook: ${requests.length}`);
     assert.ok(sent.every((e) => /^[0-9a-f]{40}$/.test(e.sourceHead || "") || e.sourceHead === null), "the sender stamps the head it sees");
-    assert.equal(requests[0].body.metadata.pluginVersion, "0.7.0");
+    assert.equal(requests[0].body.metadata.pluginVersion, "0.7.1");
   });
 });
 
@@ -2468,12 +2468,27 @@ test("The monitor delivers a finished review of a watched PR once, and the Stop 
     const watcher = await runWatcher({ api, home, cwd: repo, sid });
     assert.equal(watcher.code, 0, "a live monitor covers reviews, so the watcher exits at once");
 
-    inbox = [reviewedEntry()];
-    const tick = await runMonitor({ api, home, cwd: repo, sid });
+    // The developer is working: a finished review waits, clean or not.
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "UserPromptSubmit", session_id: sid, cwd: repo, prompt: "add retry to the mail view loader" } });
+    inbox = [reviewedEntry({ issues: [], score: 5, title: "Libra 5/5" })];
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", "mid-turn: a clean review is held");
+    // Claude finished, but the developer is still on it: still held.
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "Stop", session_id: sid, cwd: repo } });
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", "a turn ended, but the developer is still on it");
+    // Away for a while: told once, as a finished-while-idle line.
+    const clean = await runMonitor({ api, home, cwd: repo, sid, env: { LIBRA_HOOK_HELD_IDLE_MS: "1" } });
+    assertContextBlock(clean.stdout.trim(), { numbered: false });
+    assert.match(clean.stdout, /no issues found in what Libra ran/);
+    assert.match(clean.stdout, /finished while the session was idle/);
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid, env: { LIBRA_HOOK_HELD_IDLE_MS: "1" } })).stdout, "", "delivered once");
+
+    // A later run with issues, once the developer is done, is told once and not raised again at Stop.
+    inbox = [reviewedEntry({ runId: "run-bbb" })];
+    const tick = await runMonitor({ api, home, cwd: repo, sid, env: { LIBRA_HOOK_HELD_IDLE_MS: "1" } });
     assertContextBlock(tick.stdout.trim());
-    assert.match(tick.stdout, /Libra's review of this PR finished\. When you reach a stopping point/);
+    assert.match(tick.stdout, /Libra's review of this PR finished while the session was idle/);
     assert.match(tick.stdout, /Gmail thread reads return 404/);
-    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", "delivered once");
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid, env: { LIBRA_HOOK_HELD_IDLE_MS: "1" } })).stdout, "", "delivered once");
     const stop = await runHook({ api, home, cwd: repo, input: { hook_event_name: "Stop", session_id: sid, cwd: repo } });
     assert.equal(stop.stdout, "", "Stop does not raise it again");
   });

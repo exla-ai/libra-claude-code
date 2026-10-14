@@ -298,13 +298,13 @@ Code 2.1.287 or newer (read from the session transcript) and stays off on older
 versions, which may not run hooks in the background.
 
 **The session monitor** (`monitors/monitors.json`, interactive sessions only) checks
-Libra once a minute. While the session watches a PR it delivers the finished review
-as soon as it lands, mid-turn or idle, so the Stop watcher above stands down while
-the monitor runs. While you are active (a prompt in the last two hours) it also asks,
-at most every ten minutes, for production problems that became news. It never tells
-them mid-task: it holds them until you are done (Claude finished a turn that committed,
-pushed, or opened a PR, or Claude finished and you have not typed for 10 minutes),
-then tells Claude about each once on this machine, as what was observed and its
+Libra once a minute. While the session watches a PR it checks for the finished
+review, so the Stop watcher above stands down while the monitor runs. While you are
+active (a prompt in the last two hours) it also asks, at most every ten minutes, for
+production problems that became news. It never tells either mid-task (0.7.1 for
+reviews, clean ones included): it holds them until you are done (Claude finished a
+turn that committed, pushed, or opened a PR, or Claude finished and you have not
+typed for 10 minutes), then tells Claude about each once on this machine, as what was observed and its
 measured impact. A window left open for days makes no requests. Each
 tick is a fresh process, so it always runs the newest installed copy, and it ends
 when Claude Code exits.
