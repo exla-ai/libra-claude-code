@@ -119,13 +119,51 @@ How to release:
 2. Deploy the API first. It keeps answering every plugin version still reported
    in `developer_sessions` metadata (`activeRisks`, `reviewQueue` and
    `promptMatches` stay until no session reports a version before 0.5.0).
-3. Run `node --test libra-claude-code/scripts/libra-hook.test.mjs`. CI does not run
-   it. The tests build their notes with the real server code, so they cover the
-   whole path.
+3. From the Libra repository root, run
+   `node --import ./api/node_modules/tsx/dist/esm/index.mjs --test libra-claude-code/scripts/libra-hook.test.mjs`
+   and `node --test libra-claude-code/scripts/install-codex-hooks.test.mjs`.
+   The integration tests use the real server note builders and a temporary HOME.
+   They cover transport, redaction, crash recovery, upgrades, withdrawn notes,
+   activity races, quiet policy, local context caches and delivery receipts.
 4. Publish from merged `main` to `exla-ai/libra-claude-code`. Open sessions pick
    it up within about 15 minutes.
 5. At most one release a day, unless it fixes something broken on a developer's
    machine. Batch the rest.
+
+## Contract 2, plugin 2.0.0
+
+The server writes every production note, PR review, commit finding, failure match
+and subagent context block. Requests report `plugin.contract: 2`, the running and
+launch versions, installed hook capabilities, monitor availability and local turn
+state. Responses require `contract: 2`, `policy`, `evaluated` family keys and
+`notes`. A missing or malformed contract produces no new output. Contract 2 never
+reconstructs messages from legacy risk rows, review inbox contents or findings.
+
+Each note declares `delivery.when`, `to`, `wake` and `ttlMs`. Timing policy is
+bounded locally. Server quiet mode silences every delivery surface, including
+cached local context. User-triggered hooks can show notes or provide context;
+background monitor and watcher output requires explicit wake permission and a
+final local check that no new turn or tool continuation has started. A Stop
+continuation never blocks again while `stop_hook_active` is true.
+
+Held state contains IDs, family keys and deadlines, with no note text. Before
+release, the client asks the server again and renders its current answer.
+A successful response withdraws absent IDs only for families it explicitly
+evaluated. Failed requests and malformed families preserve held IDs until expiry.
+Old held files are replaced with IDs before their contents can be used.
+Failure and subagent caches use separate bounded, expiring server blocks.
+
+Once-only claims are scoped to the machine or session. They are acquired before
+output and rolled back if the final activity check cancels delivery. After an
+output write succeeds, `libra_surfaced` records the channel, family, IDs and timing;
+held or dropped items use `libra_delivery`. Context delivered to the coding agent
+is recorded separately from text directly displayed to the developer. Pending
+receipts survive failed requests and process exits, with a 50-file bound.
+
+Old launch arguments still work. An installed old hook can hand off to the newest
+installed version while reporting its original hook wiring. The API must be
+updated before publishing the plugin. An open window whose old installation has
+been removed by Claude Code needs a restart to restore its hooks.
 
 ## Investigations run on Libra's server
 
