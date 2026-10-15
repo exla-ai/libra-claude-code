@@ -1049,7 +1049,7 @@ test("A tool call records locally and returns at once; a background sender posts
     assert.equal(sent.length, 6, "every tool event reached the server");
     assert.ok(requests.length <= 3, `a burst goes out in a few batches, not one per hook: ${requests.length}`);
     assert.ok(sent.every((e) => /^[0-9a-f]{40}$/.test(e.sourceHead || "") || e.sourceHead === null), "the sender stamps the head it sees");
-    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.0");
+    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.1");
   });
 });
 
@@ -1166,7 +1166,7 @@ test("v2 sends capabilities and state, uses server prose once, and keeps Codex c
     assert.match(shown.hookSpecificOutput.additionalContext, /3 requests returned 500/);
     assert.doesNotMatch(shown.hookSpecificOutput.additionalContext, /\*\*Libra flagged/);
     assert.equal(requests[0].body.plugin.contract, 2);
-    assert.equal(requests[0].body.plugin.version, "2.0.0");
+    assert.equal(requests[0].body.plugin.version, "2.0.1");
     assert.equal(requests[0].body.plugin.state.phase, "working");
     assert.ok(requests[0].body.plugin.capabilities.hooks.includes("Stop"));
     assert.equal((await runHook({ api, home, cwd: repo, input: { ...input, session_id: "another-window" } })).stdout, "");
@@ -1477,7 +1477,7 @@ test("v2 compaction re-injects context without consuming visible once-only news"
 test("v2 old launch handoff reports original wiring and never prints from a legacy async argv", async () => {
   const current = fs.readFileSync(HOOK, "utf8");
   const install = makeInstall({ marketplaceScript: current });
-  fs.writeFileSync(install.hook, current.replace('const PLUGIN_VERSION = "2.0.0";', 'const PLUGIN_VERSION = "0.7.1";'));
+  fs.writeFileSync(install.hook, current.replace('const PLUGIN_VERSION = "2.0.1";', 'const PLUGIN_VERSION = "0.7.1";'));
   const launchRoot = path.dirname(path.dirname(install.hook));
   fs.mkdirSync(path.join(launchRoot, "hooks"), { recursive: true });
   fs.writeFileSync(path.join(launchRoot, "hooks", "hooks.json"), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command" }] }], PostToolUse: [{ hooks: [{ type: "command" }] }] } }));
@@ -1486,7 +1486,7 @@ test("v2 old launch handoff reports original wiring and never prints from a lega
     const env = { LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test", LIBRA_HOOK_FLUSH: "inline" };
     const shown = await runInstalled({ ...install, env, input: { hook_event_name: "SessionStart", source: "startup", session_id: "old-v2-handoff", cwd: repo } });
     assert.match(shown.stdout, /Measured request failures/);
-    assert.equal(requests[0].body.plugin.version, "2.0.0");
+    assert.equal(requests[0].body.plugin.version, "2.0.1");
     assert.equal(requests[0].body.plugin.capabilities.launchVersion, "0.7.1");
     assert.deepEqual(requests[0].body.plugin.capabilities.hooks, ["SessionStart", "PostToolUse"]);
     const background = await runInstalled({ ...install, env, args: ["claude-code", "async"], input: { hook_event_name: "PostToolUse", session_id: "old-v2-handoff", cwd: repo, tool_name: "Bash", tool_input: { command: "gh pr checks 42" } } });
@@ -1541,5 +1541,87 @@ test("v2 clamps hostile timing policy and expires old held IDs without surfacing
     await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionEnd", session_id: sid, cwd: repo } });
     assert.ok(deliveryEvents(requests).some((event) => event.payload.outcome === "expired"));
     assert.equal(surfacedIn(requests).length, 0);
+  });
+});
+
+test("v2 an unmatched local failure is silent and never becomes a held finding", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-")), sid = "v2-unmatched-failure";
+  const block = v2BlockFixture({ key: "failure", kind: "failure_match", when: "on_failure", to: "session", items: [{
+    id: "production-signature", once: true, match: "mailbox connection failed because provider token expired",
+    context: ["A measured production signature"], title: "Production connection failure",
+  }] });
+  await withApi({ [EVENTS]: () => v2Answer([block]) }, async (api, requests) => {
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionStart", session_id: sid, cwd: repo } });
+    const local = await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUseFailure", session_id: sid, cwd: repo, error: "An unrelated local test asserted an incorrect expected value" } });
+    assert.equal(local.stdout, "");
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionEnd", session_id: sid, cwd: repo } });
+    assert.deepEqual(readHeldFixture(home, sid).items, []);
+    assert.equal(surfacedIn(requests).length, 0);
+    assert.equal(deliveryEvents(requests).filter((event) => event.payload.kind === "failure_match").length, 0, "no signature matched, so there was no finding to defer");
+  });
+});
+
+test("v2 a server-timed PR review reports timing_wait rather than an unrenderable finding", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-")), sid = "v2-review-timing";
+  const block = v2BlockFixture({ key: "review:42", kind: "pr_review", when: "when_done", wake: true });
+  await withApi({ [EVENTS]: () => v2Answer([block]) }, async (api, requests) => {
+    assert.equal((await runHook({ api, home, cwd: repo, input: { hook_event_name: "UserPromptSubmit", session_id: sid, cwd: repo, prompt: "Fix the failing tests on this PR" } })).stdout, "");
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionEnd", session_id: sid, cwd: repo } });
+    const receipts = deliveryEvents(requests).filter((event) => event.payload.kind === "pr_review");
+    assert.equal(receipts.length, 1);
+    assert.equal(receipts[0].payload.reason, "timing_wait");
+    assert.equal(receipts[0].payload.outcome, "deferred");
+    assert.equal(readHeldFixture(home, sid).items[0].id, "note-v2");
+  });
+});
+
+test("v2 passive transcript appends cannot permanently strand a freshly revalidated held note", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-")), sid = "v2-metadata-release";
+  const transcript = path.join(repo, "passive-transcript.jsonl");
+  const old = new Date(Date.now() - 180_000).toISOString();
+  fs.writeFileSync(transcript, JSON.stringify({ type: "assistant", timestamp: old, message: { role: "assistant", content: [{ type: "text", text: "The requested change is complete." }] } }) + "\n");
+  let context = "EARLIER-HELD-OBSERVATION";
+  await withApi({ [MONITOR]: () => v2Answer([v2BlockFixture({ when: "when_done", wake: true, context: [context] })]) }, async (api) => {
+    seedWatch(home, sid);
+    seedV2State(home, sid, { turnAt: Date.now(), stoppedAt: 0, transcriptPath: transcript });
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "");
+    assert.equal(readHeldFixture(home, sid).items.length, 1);
+    seedV2State(home, sid, { shippedAt: Date.now() - 150_000, transcriptPath: transcript });
+    fs.appendFileSync(transcript, [
+      JSON.stringify({ type: "file-history-snapshot", snapshot: { timestamp: new Date().toISOString(), trackedFileBackups: {} } }),
+      JSON.stringify({ type: "system", subtype: "turn_duration", timestamp: new Date().toISOString(), durationMs: 1000 }),
+      JSON.stringify({ type: "system", subtype: "stop_hook_summary", timestamp: new Date().toISOString() }),
+    ].join("\n") + "\n");
+    context = "FRESH-REVALIDATED-OBSERVATION";
+    const released = await runMonitor({ api, home, cwd: repo, sid });
+    assert.match(released.stdout, /FRESH-REVALIDATED-OBSERVATION/);
+    assert.doesNotMatch(released.stdout, /EARLIER-HELD-OBSERVATION/);
+    assert.equal(readHeldFixture(home, sid).items.length, 0);
+  });
+});
+
+test("v2 actual transcript turns and incomplete transcript evidence still prevent spontaneous delivery", async () => {
+  const repo = makeRepo();
+  const stoppedAt = Date.now() - 120_000;
+  const old = JSON.stringify({ type: "assistant", timestamp: new Date(Date.now() - 180_000).toISOString(), message: { role: "assistant", content: [] } }) + "\n";
+  const cases = [
+    ["assistant continuation during Stop settle interval", old + JSON.stringify({ type: "assistant", timestamp: new Date(stoppedAt + 50).toISOString(), message: { role: "assistant", content: [{ type: "tool_use", id: "within-settle", name: "Bash", input: { command: "npm test" } }] } })],
+    ["assistant continuation", old + JSON.stringify({ type: "assistant", timestamp: new Date().toISOString(), message: { role: "assistant", content: [{ type: "tool_use", id: "new-call", name: "Bash", input: { command: "npm test" } }] } })],
+    ["tool result", old + JSON.stringify({ type: "user", timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "new-call", content: "The command finished." }] } })],
+    ["unknown record", old + JSON.stringify({ type: "unknown-new-event", timestamp: new Date().toISOString() })],
+    ["missing timestamp", old + JSON.stringify({ type: "assistant", message: { role: "assistant", content: [] } })],
+    ["malformed tail", old + '{"type":"assistant"'],
+    ["truncated history without anchor", old + Array.from({ length: 1800 }, () => JSON.stringify({ type: "file-history-snapshot", snapshot: { timestamp: new Date().toISOString(), trackedFileBackups: {} } })).join("\n")],
+    ["unreadable transcript", null],
+  ];
+  await withApi({ [MONITOR]: () => v2Answer([v2BlockFixture({ when: "when_done", wake: true })]) }, async (api) => {
+    for (const [index, [label, text]] of cases.entries()) {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-")), sid = `v2-transcript-proof-${index}`;
+      const transcript = path.join(home, "transcript.jsonl");
+      if (text != null) fs.writeFileSync(transcript, text + "\n");
+      seedWatch(home, sid); seedV2State(home, sid, { stoppedAt, turnAt: stoppedAt - 60_000, promptedAt: stoppedAt - 60_000, shippedAt: stoppedAt - 30_000, transcriptPath: transcript });
+      assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", label);
+      assert.equal(readHeldFixture(home, sid).items.length, 1, `${label}: IDs remain held for fresh revalidation`);
+    }
   });
 });

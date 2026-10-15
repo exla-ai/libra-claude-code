@@ -12,7 +12,7 @@ const MAX_EVENTS_PER_POST = 50;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "2.0.0";
+const PLUGIN_VERSION = "2.0.1";
 const MAX_PENDING_SURFACED = 50;
 // Fast updates (see runNewestInstalledCopy): where this copy lives, how often
 // a hook may ask Claude Code to refresh the plugin, and the size cap for
@@ -766,14 +766,57 @@ function finishDeliveryTurn(id, input) {
   const tasks = input.background_tasks;
   saveDeliveryState(id, { stoppedAt: Date.now(), stopBackground: Array.isArray(tasks) ? tasks.length > 0 : Boolean(tasks) });
 }
+// A later file mtime can be a snapshot or duration record, not a new turn.
+// Establish a timestamped conversation anchor at/before the boundary before
+// ignoring a passive append. Unknown or incomplete tails remain busy.
+function transcriptContinuedAfter(transcriptPath, boundaryMs) {
+  if (!transcriptPath) return false;
+  let fd;
+  try {
+    fd = fs.openSync(transcriptPath, "r");
+    const before = fs.fstatSync(fd);
+    if (!before.isFile()) return true;
+    if (before.mtimeMs <= boundaryMs) return false;
+    const length = Math.min(before.size, 65_536);
+    if (!length) return true;
+    const buffer = Buffer.alloc(length);
+    const offset = before.size - length;
+    if (fs.readSync(fd, buffer, 0, length, offset) !== length) return true;
+    const after = fs.fstatSync(fd);
+    if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) return true;
+    let text = buffer.toString("utf8");
+    if (offset > 0) {
+      const firstBreak = text.indexOf("\n");
+      if (firstBreak < 0) return true;
+      text = text.slice(firstBreak + 1);
+    }
+    let anchored = false;
+    for (const line of text.split(/\r?\n/).filter((line) => line.trim())) {
+      const record = JSON.parse(line);
+      if (!isRecord(record)) return true;
+      const timestamp = record.timestamp ?? (record.type === "file-history-snapshot" ? record.snapshot?.timestamp : null);
+      const at = typeof timestamp === "string" ? Date.parse(timestamp) : NaN;
+      if (!Number.isFinite(at)) return true;
+      if (record.type === "user" || record.type === "assistant") {
+        if (!isRecord(record.message)) return true;
+        if (at > boundaryMs) return true;
+        anchored = true;
+      } else if (record.type === "file-history-snapshot"
+        || (record.type === "system" && ["turn_duration", "stop_hook_summary"].includes(record.subtype))) {
+        // These records describe saved files or a completed turn. They cannot
+        // independently start a new coding turn.
+      } else return true;
+    }
+    return !anchored;
+  } catch { return true; }
+  finally { if (fd != null) try { fs.closeSync(fd); } catch {} }
+}
 function deliveryPhase(id, now = Date.now()) {
   const state = readDeliveryState(id);
   const policy = deliveryPolicy(id);
   const stopped = Number(state.stoppedAt || 0);
-  let transcriptAt = 0;
-  try { if (state.transcriptPath) transcriptAt = fs.statSync(state.transcriptPath).mtimeMs; } catch {}
   if (!stopped || Math.max(Number(state.turnAt || 0), Number(state.toolAt || 0), Number(state.wakeAt || 0)) > stopped
-    || transcriptAt > stopped + policy.stopSettleMs || now - stopped < policy.stopSettleMs) return "working";
+    || transcriptContinuedAfter(state.transcriptPath, stopped) || now - stopped < policy.stopSettleMs) return "working";
   if (!state.stopBackground && ((policy.doneOnShip && Number(state.shippedAt || 0) >= Number(state.promptedAt || Infinity)) || now - stopped >= policy.idleMs)) return "done";
   return "between_turns";
 }
@@ -828,11 +871,11 @@ function pluginReportV2(body) {
       watching: { prs: readWatchedPrs(id), investigations: readInvestigations(id) }, policyRev: deliveryPolicy(id).rev } };
 }
 function deliveryReceipt(context, block, outcome, reason, ids) {
-  const aliases = { server_contract_missing: "contract_mismatch", already_delivered: "already_shown", legacy_claimed: "claim_lost", wake_disabled: "wake_disallowed", timing: "cannot_show" };
+  const aliases = { server_contract_missing: "contract_mismatch", already_delivered: "already_shown", legacy_claimed: "claim_lost", wake_disabled: "wake_disallowed", timing: "timing_wait" };
   reason = aliases[reason] || reason;
   if (reason === "quiet") outcome = "suppressed";
   else if (reason === "expired") outcome = "expired";
-  else if (outcome === "held" && ["cannot_show", "wake_disallowed", "compact"].includes(reason)) outcome = "deferred";
+  else if (outcome === "held" && ["cannot_show", "wake_disallowed", "compact", "timing_wait"].includes(reason)) outcome = "deferred";
   const payload = { contract: 2, pluginVersion: PLUGIN_VERSION, kind: block.kind || "note", key: block.key || "", family: block.key || "",
     outcome, reason, noteIds: ids, titles: block.titles || [], when: block.delivery?.when || block.when || null, to: block.delivery?.to || null, channel: null, surface: context.point, deliveryPoint: context.point, phase: deliveryPhase(context.sessionExternalId), policyRev: deliveryPolicy(context.sessionExternalId).rev };
   // Holds and repeated offline polls must not fill the pending queue.
@@ -858,7 +901,11 @@ function localDeliveryV2(point, input, context) {
     const cached = JSON.parse(fs.readFileSync(sessionContextPath(context.sessionExternalId), "utf8"));
     if (cached.contract !== 2 || Date.now() - cached.at > deliveryPolicy(context.sessionExternalId).contextMaxAgeMs || cached.at > Date.now()) return null;
     const notes = cached.notes.filter((block) => Date.now() - cached.at < block.delivery.ttlMs).map((block) => ({ ...block,
-      items: point === "PostToolUseFailure" ? block.items.filter((item) => item.match && signaturePattern(item.match)?.test(normalizeErrorText(input.error || ""))).slice(0, 2) : block.items }));
+      items: point === "PostToolUseFailure" ? block.items.filter((item) => item.match && signaturePattern(item.match)?.test(normalizeErrorText(input.error || ""))).slice(0, 2) : block.items }))
+      .filter((block) => point === "PostToolUseFailure"
+        ? block.delivery.when === "on_failure" && block.items.length > 0
+        : block.delivery.when === "on_subagent" && (block.items.length > 0 || block.context.length > 0));
+    if (!notes.length) return null;
     return deliverNotesV2(point, { contract: 2, policy: deliveryPolicy(context.sessionExternalId), evaluated: [], notes }, { ...context, repo: cached.repo }, input, true);
   } catch { return null; }
 }
@@ -991,9 +1038,7 @@ function deliverNotesV2(point, response, context, input = {}, fromCache = false)
         if (spontaneous) return deliveryPhase(id) !== "working";
         if (point === "Stop") {
           const latest = readDeliveryState(id);
-          let transcriptContinued = false;
-          try { if (latest.transcriptPath) transcriptContinued = fs.statSync(latest.transcriptPath).mtimeMs > HOOK_STARTED_AT; } catch {}
-          return !transcriptContinued && Number(latest.turnAt || 0) <= HOOK_STARTED_AT && Number(latest.toolAt || 0) <= HOOK_STARTED_AT;
+          return !transcriptContinuedAfter(latest.transcriptPath, HOOK_STARTED_AT) && Number(latest.turnAt || 0) <= HOOK_STARTED_AT && Number(latest.toolAt || 0) <= HOOK_STARTED_AT;
         }
         return true;
       },

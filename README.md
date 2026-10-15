@@ -54,6 +54,13 @@ compaction, and session end. It also records native Codex `SessionStart`,
 hooks. If only MCP is installed, the coding agent can call Libra tools, but no
 automatic session events are sent.
 
+## 2.0.1 delivery fixes
+
+Deferred news waits for the actual end of a turn. Passive transcript bookkeeping
+no longer keeps it held forever, while real continuation and unknown transcript
+content still prevent delivery. Timing waits are recorded separately from failed
+delivery. Empty local failure checks do not record a note that was never shown.
+
 ## Updating
 
 Third-party marketplaces do not auto-update by default. Turn it on once in
