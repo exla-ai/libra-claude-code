@@ -61,6 +61,16 @@ no longer keeps it held forever, while real continuation and unknown transcript
 content still prevent delivery. Timing waits are recorded separately from failed
 delivery. Empty local failure checks do not record a note that was never shown.
 
+## 2.0.2 delivery fixes
+
+An answer you asked for no longer waits for the turn to end. The server marks
+a finished investigation `interrupt`, and the session monitor delivers it
+mid-turn; other news is still held until the turn ends. Older plugins ignore the
+field and show the answer at the next prompt or turn end. A PR review now
+arrives at the next prompt or turn end instead of waiting for the session to
+finish. A clean review is a one-line note for you, and a review with issues goes
+to the agent.
+
 ## Updating
 
 Third-party marketplaces do not auto-update by default. Turn it on once in

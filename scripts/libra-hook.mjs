@@ -12,7 +12,7 @@ const MAX_EVENTS_PER_POST = 50;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "2.0.1";
+const PLUGIN_VERSION = "2.0.2";
 const MAX_PENDING_SURFACED = 50;
 // Fast updates (see runNewestInstalledCopy): where this copy lives, how often
 // a hook may ask Claude Code to refresh the plugin, and the size cap for
@@ -836,7 +836,7 @@ function readHeldV2(id) {
     }
     return (Array.isArray(raw.items) ? raw.items : []).filter((item) => isRecord(item) && typeof item.id === "string" && typeof item.key === "string" && DELIVERY_WHEN.has(item.when))
       .slice(0, 50).map((item) => ({ id: cleanField(item.id, 300, { label: true }), key: cleanField(item.key, 80, { label: true }), when: item.when,
-        since: Number(item.since), ttlMs: Math.min(Number(item.ttlMs) || 0, deliveryPolicy(id).heldMaxMs) }));
+        since: Number(item.since), ttlMs: Math.min(Number(item.ttlMs) || 0, deliveryPolicy(id).heldMaxMs), ...(item.interrupt === true ? { interrupt: true } : {}) }));
   } catch { return []; }
 }
 function pluginReportV2(body) {
@@ -889,7 +889,8 @@ function cleanBlocksV2(notes) {
       || typeof raw.delivery.wake !== "boolean" || !Number.isFinite(raw.delivery.ttlMs) || raw.delivery.ttlMs <= 0 || !raw.key) return [];
     const base = cleanNoteBlocks([raw])[0];
     return [{ ...base, key: cleanField(raw.key, 80, { label: true }), pause: raw.pause === true,
-      delivery: { when: raw.delivery.when, to: raw.delivery.to, wake: raw.delivery.wake, ttlMs: Math.min(raw.delivery.ttlMs, 259_200_000) },
+      delivery: { when: raw.delivery.when, to: raw.delivery.to, wake: raw.delivery.wake, ttlMs: Math.min(raw.delivery.ttlMs, 259_200_000),
+        interrupt: raw.delivery.interrupt === true && raw.delivery.when === "now" && raw.delivery.wake === true },
       items: (Array.isArray(raw.items) ? raw.items : []).filter(isRecord).slice(0, 100).map((item) => ({ ...cleanNoteItem(item),
         legacyClaims: (Array.isArray(item.legacyClaims) ? item.legacyClaims : []).filter((key) => typeof key === "string").slice(0, 5).map((key) => cleanField(key, 300)).filter(Boolean), quote: typeof item.quote === "string" ? item.quote.slice(0, 6000).split(/\r?\n/).slice(0, 90).map((line) => `    ${cleanField(line, 1_000)}`).join("\n") : "",
         match: typeof item.match === "string" ? cleanField(item.match, 200) : "" })) }];
@@ -962,21 +963,26 @@ function deliverNotesV2(point, response, context, input = {}, fromCache = false)
         || (when === "on_failure" && point === "PostToolUseFailure") || (when === "on_subagent" && point === "SubagentStart");
       const canShow = context.visible && !(point === "SessionStart" && input.source === "compact") && !spontaneous && !["SubagentStart", "PostToolUseFailure", "Stop"].includes(point);
       const hasOutput = block.context.length || block.items.some((item) => item.context.length || item.quote || (canShow && block.header && item.line));
-      const reason = point === "SessionStart" && input.source === "compact" && block.items.some((item) => item.once) ? "compact" : !hasOutput ? "cannot_show" : policy.quiet ? "quiet" : spontaneous && phase === "working" ? "mid_turn" : spontaneous && !block.delivery.wake ? "wake_disabled"
+      const reason = point === "SessionStart" && input.source === "compact" && block.items.some((item) => item.once) ? "compact" : !hasOutput ? "cannot_show" : policy.quiet ? "quiet" : spontaneous && phase === "working" && !block.delivery.interrupt ? "mid_turn" : spontaneous && !block.delivery.wake ? "wake_disabled"
         : point === "Stop" && isFlagSet(input.stop_hook_active ?? input.stopHookActive) ? "stop_hook_active" : !allowed ? "timing" : null;
       if (reason) {
-        for (const item of block.items.filter((item) => item.id)) if (!held.some((entry) => entry.id === item.id && entry.key === block.key)) held.push({ id: item.id, key: block.key, when, since: now, ttlMs: block.delivery.ttlMs });
+        for (const item of block.items.filter((item) => item.id)) if (!held.some((entry) => entry.id === item.id && entry.key === block.key)) held.push({ id: item.id, key: block.key, when, since: now, ttlMs: block.delivery.ttlMs, ...(block.delivery.interrupt ? { interrupt: true } : {}) });
         deliveryReceipt(context, block, "held", reason, block.items.map((item) => item.id).filter(Boolean));
       } else picked.push(block);
     }
     // Network latency and another hook may have started work since the request.
+    // An interrupting note (an answer the developer is waiting on) may land mid-turn.
     if (spontaneous && deliveryPhase(id) === "working") {
-      for (const block of picked) {
+      const waiting = picked.filter((block) => !block.delivery.interrupt);
+      for (const block of waiting) {
         for (const item of block.items.filter((item) => item.id)) if (!held.some((entry) => entry.id === item.id && entry.key === block.key)) held.push({ id: item.id, key: block.key, when: block.delivery.when, since: now, ttlMs: block.delivery.ttlMs });
         deliveryReceipt(context, block, "held", "mid_turn", block.items.map((item) => item.id));
       }
-      writeFileAtomic(heldNotesPath(id), JSON.stringify({ contract: 2, items: held.slice(-50) }));
-      return null;
+      picked.splice(0, picked.length, ...picked.filter((block) => block.delivery.interrupt));
+      if (!picked.length) {
+        writeFileAtomic(heldNotesPath(id), JSON.stringify({ contract: 2, items: held.slice(-50) }));
+        return null;
+      }
     }
     const global = readGlobalState();
     const rendered = [];
@@ -1031,11 +1037,12 @@ function deliverNotesV2(point, response, context, input = {}, fromCache = false)
     }
     writeFileAtomic(heldNotesPath(id), JSON.stringify({ contract: 2, items: held.slice(-50) }));
     if (!output) { rollbackDeliveryClaims(claimed); return null; }
+    const interruptOnly = rendered.length > 0 && rendered.every(({ block }) => block.delivery.interrupt);
     return {
       output, spontaneous,
       ready: () => {
         if (deliveryPolicy(id).quiet) return false;
-        if (spontaneous) return deliveryPhase(id) !== "working";
+        if (spontaneous) return deliveryPhase(id) !== "working" || interruptOnly;
         if (point === "Stop") {
           const latest = readDeliveryState(id);
           return !transcriptContinuedAfter(latest.transcriptPath, HOOK_STARTED_AT) && Number(latest.turnAt || 0) <= HOOK_STARTED_AT && Number(latest.toolAt || 0) <= HOOK_STARTED_AT;
@@ -1946,7 +1953,7 @@ async function runMonitorTick() {
   try { state = JSON.parse(fs.readFileSync(statePath, "utf8")) || {}; } catch {}
   const lastActive = Number(readDeliveryState(sessionExternalId).promptedAt || 0) || null;
   const policy = deliveryPolicy(sessionExternalId);
-  const heldDue = readHeldV2(sessionExternalId).some((item) => deliveryPhase(sessionExternalId, now) !== "working" && (item.when !== "when_done" || deliveryPhase(sessionExternalId, now) === "done"));
+  const heldDue = readHeldV2(sessionExternalId).some((item) => item.interrupt || (deliveryPhase(sessionExternalId, now) !== "working" && (item.when !== "when_done" || deliveryPhase(sessionExternalId, now) === "done")));
   const newsDue = heldDue || (lastActive != null && now - lastActive < policy.activeWindowMs && now - Number(state.lastNewsAt || 0) >= policy.newsEveryMs);
   const investigations = readInvestigations(sessionExternalId);
   if (!watched.length && !newsDue && !investigations.length) {

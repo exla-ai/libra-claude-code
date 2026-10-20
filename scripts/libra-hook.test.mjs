@@ -1049,7 +1049,7 @@ test("A tool call records locally and returns at once; a background sender posts
     assert.equal(sent.length, 6, "every tool event reached the server");
     assert.ok(requests.length <= 3, `a burst goes out in a few batches, not one per hook: ${requests.length}`);
     assert.ok(sent.every((e) => /^[0-9a-f]{40}$/.test(e.sourceHead || "") || e.sourceHead === null), "the sender stamps the head it sees");
-    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.1");
+    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.2");
   });
 });
 
@@ -1166,7 +1166,7 @@ test("v2 sends capabilities and state, uses server prose once, and keeps Codex c
     assert.match(shown.hookSpecificOutput.additionalContext, /3 requests returned 500/);
     assert.doesNotMatch(shown.hookSpecificOutput.additionalContext, /\*\*Libra flagged/);
     assert.equal(requests[0].body.plugin.contract, 2);
-    assert.equal(requests[0].body.plugin.version, "2.0.1");
+    assert.equal(requests[0].body.plugin.version, "2.0.2");
     assert.equal(requests[0].body.plugin.state.phase, "working");
     assert.ok(requests[0].body.plugin.capabilities.hooks.includes("Stop"));
     assert.equal((await runHook({ api, home, cwd: repo, input: { ...input, session_id: "another-window" } })).stdout, "");
@@ -1228,6 +1228,30 @@ test("v2 release uses refreshed server content, and a failed or unrelated respon
     assert.match(fresh.stdout, /FRESH-CONTEXT/);
     assert.doesNotMatch(fresh.stdout, /OLD-CONTEXT/);
     assert.equal(readHeldFixture(home, sid).items.length, 0);
+  });
+});
+
+test("v2 delivers an interrupting answer mid-turn and still holds ordinary news", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-")), sid = "v2-interrupt";
+  const answer = v2BlockFixture({ key: "investigations", id: "investigation:inv_1", wake: true, line: "", context: ["Answer: 12 failures in the last hour."], delivery: { when: "now", to: "machine", wake: true, ttlMs: 86_400_000, interrupt: true } });
+  const news = v2BlockFixture({ wake: true, context: ["NEWS-WAITS"] });
+  await withApi({ [EVENTS]: () => v2Answer(), [MONITOR]: () => v2Answer([answer, news]) }, async (api) => {
+    seedWatch(home, sid); seedV2State(home, sid, { turnAt: Date.now(), stoppedAt: 0 });
+    const out = await runMonitor({ api, home, cwd: repo, sid });
+    assert.match(out.stdout, /12 failures in the last hour/);
+    assert.doesNotMatch(out.stdout, /NEWS-WAITS/);
+    assert.deepEqual(readHeldFixture(home, sid).items.map((item) => item.id), ["note-v2"]);
+  });
+});
+
+test("v2 ignores interrupt on a note that is not now with wake", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-")), sid = "v2-interrupt-bad";
+  const note = v2BlockFixture({ wake: true, context: ["MUST-WAIT"], delivery: { when: "when_done", to: "machine", wake: true, ttlMs: 86_400_000, interrupt: true } });
+  await withApi({ [EVENTS]: () => v2Answer(), [MONITOR]: () => v2Answer([note]) }, async (api) => {
+    seedWatch(home, sid); seedV2State(home, sid, { turnAt: Date.now(), stoppedAt: 0 });
+    const out = await runMonitor({ api, home, cwd: repo, sid });
+    assert.equal(out.stdout, "");
+    assert.deepEqual(readHeldFixture(home, sid).items.map((item) => item.id), ["note-v2"]);
   });
 });
 
@@ -1477,7 +1501,7 @@ test("v2 compaction re-injects context without consuming visible once-only news"
 test("v2 old launch handoff reports original wiring and never prints from a legacy async argv", async () => {
   const current = fs.readFileSync(HOOK, "utf8");
   const install = makeInstall({ marketplaceScript: current });
-  fs.writeFileSync(install.hook, current.replace('const PLUGIN_VERSION = "2.0.1";', 'const PLUGIN_VERSION = "0.7.1";'));
+  fs.writeFileSync(install.hook, current.replace('const PLUGIN_VERSION = "2.0.2";', 'const PLUGIN_VERSION = "0.7.1";'));
   const launchRoot = path.dirname(path.dirname(install.hook));
   fs.mkdirSync(path.join(launchRoot, "hooks"), { recursive: true });
   fs.writeFileSync(path.join(launchRoot, "hooks", "hooks.json"), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command" }] }], PostToolUse: [{ hooks: [{ type: "command" }] }] } }));
@@ -1486,7 +1510,7 @@ test("v2 old launch handoff reports original wiring and never prints from a lega
     const env = { LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test", LIBRA_HOOK_FLUSH: "inline" };
     const shown = await runInstalled({ ...install, env, input: { hook_event_name: "SessionStart", source: "startup", session_id: "old-v2-handoff", cwd: repo } });
     assert.match(shown.stdout, /Measured request failures/);
-    assert.equal(requests[0].body.plugin.version, "2.0.1");
+    assert.equal(requests[0].body.plugin.version, "2.0.2");
     assert.equal(requests[0].body.plugin.capabilities.launchVersion, "0.7.1");
     assert.deepEqual(requests[0].body.plugin.capabilities.hooks, ["SessionStart", "PostToolUse"]);
     const background = await runInstalled({ ...install, env, args: ["claude-code", "async"], input: { hook_event_name: "PostToolUse", session_id: "old-v2-handoff", cwd: repo, tool_name: "Bash", tool_input: { command: "gh pr checks 42" } } });
