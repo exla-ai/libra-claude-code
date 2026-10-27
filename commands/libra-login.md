@@ -26,11 +26,17 @@ Connect this machine to the user's **Libra** account. Walk them through it, bran
    ```
    node "${CLAUDE_PLUGIN_ROOT}/scripts/install-codex-hooks.mjs"
    ```
-7. Send a harmless Claude Code session heartbeat through the installed hook so the Libra dashboard can show this session immediately:
+7. Optional: Libra's tools in Codex. The Codex hooks from step 6 send session events only; Libra's MCP tools (including the daily coding report) need the Libra server registered in Codex too. Do this only if `command -v codex` finds Codex and the user wants it. If `codex mcp get libra` already shows `https://api.libra.exla.ai/mcp`, skip this step. Codex sends the key from an environment variable and stores only the variable's name, so the key never goes into Codex's config:
+   ```
+   codex mcp remove libra >/dev/null 2>&1 || true
+   codex mcp add libra --url https://api.libra.exla.ai/mcp --bearer-token-env-var LIBRA_API_TOKEN
+   ```
+   Then tell the user to add `export LIBRA_API_TOKEN=<their key>` to the shell profile Codex starts from (for example `~/.zshrc`) and to start a new Codex session. Edit the profile only if the user asks you to, and never print the key.
+8. Send a harmless Claude Code session heartbeat through the installed hook so the Libra dashboard can show this session immediately:
    ```
    node -e 'process.stdout.write(JSON.stringify({hook_event_name:"SessionStart",session_id:process.env.CLAUDE_CODE_SESSION_ID||`libra-login-${Date.now()}`,cwd:process.cwd(),prompt:"Libra login completed"}))' | node "${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs" claude-code
    ```
-8. Run `claude plugin list` and confirm `libra-claude-code` is installed and enabled. Then run `claude mcp list` and confirm `libra` is connected. If Codex is installed, check that `~/.codex/hooks.json` contains Libra `SessionStart`, `UserPromptSubmit`, and `Stop` hooks. Do not print the MCP header or the full key.
-9. Report back, branded as Libra: "Libra: logged in as <email>. Hooks are installed, Codex hooks are configured, and MCP is connected. I'll check your commits in: <repos>." If whoami returns 401 or an error, tell them the key was not accepted and to paste a fresh one. **Never echo the full key back** to the user.
+9. Run `claude plugin list` and confirm `libra-claude-code` is installed and enabled. Then run `claude mcp list` and confirm `libra` is connected. If Codex is installed, check that `~/.codex/hooks.json` contains Libra `SessionStart`, `UserPromptSubmit`, and `Stop` hooks, and if you did step 7, that `codex mcp list` lists `libra`. Do not print the MCP header or the full key.
+10. Report back, branded as Libra: "Libra: logged in as <email>. Hooks are installed, Codex hooks are configured, and MCP is connected. I'll check your commits in: <repos>." If you did step 7, add that Libra's tools are registered in Codex and work once `LIBRA_API_TOKEN` is set. If whoami returns 401 or an error, tell them the key was not accepted and to paste a fresh one. **Never echo the full key back** to the user.
 
 Once logged in, Libra checks every `git commit` Claude Code attempts through the Bash tool, scoped to the repos your account can see. Claude Code and Codex hooks also send sanitized session events and bounded transcript summaries when the hook input exposes a transcript path. MCP-only installs do not have these hooks, so if hooks are missing, tell the user to install the Libra plugin and rerun `/libra-login`.

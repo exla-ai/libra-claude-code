@@ -34,7 +34,7 @@ Ask Claude Code to install the Libra Claude Code plugin, then log in:
 This is the normal install path. It installs:
 
 - the Libra hooks for sanitized session events and commit-attempt checks,
-- the `/libra`, `/libra-login`, and `/libra-feedback` commands,
+- the `/libra`, `/libra-login`, `/libra-feedback`, `/libra-review`, and `/libra-daily` commands,
 - the `libra-ops` skill,
 - the remote MCP server at `https://api.libra.exla.ai/mcp`.
 
@@ -70,6 +70,15 @@ field and show the answer at the next prompt or turn end. A PR review now
 arrives at the next prompt or turn end instead of waiting for the session to
 finish. A clean review is a one-line note for you, and a review with issues goes
 to the agent.
+
+## 2.0.3 daily coding report
+
+Adds `/libra-daily`, which reads Libra's daily coding report for a repo, checks
+the top items against your code and live evidence, shows what is real, records a
+verdict for each item, and asks what to fix (see Daily coding report below). The
+`/libra` command and the `libra-ops` skill name the report's three tools, which
+Libra lists only once it has enabled the report for your account. No hook
+changes.
 
 ## Updating
 
@@ -386,6 +395,98 @@ often and how recently, once per production error per session. You see nothing
 directly; Claude decides whether to mention it. Both are recorded as `libra_surfaced`
 notes (`subagent_context`, `failure_match`) with `shownToUser: false`.
 
+## Daily coding report
+
+Libra's daily coding report is everything Libra noticed in one repository's
+production over a window (the last 24 hours by default, up to 14 days), written
+as markdown for your coding agent rather than for you. It shows what Libra told
+your team about, what it held back and why, and which items no model ever
+examined, and it labels Libra's own judgment as judgment. Items name the Libra
+calls that verify them. Libra builds the report from what it already stored,
+without calling a model. It stays off until Libra enables it for your account:
+until then its tools are not listed and its routes return errors (see Plain
+HTTP below).
+
+**Claude Code.** Run `/libra-daily` in the repository, or
+`/libra-daily owner/repo`, or `/libra-daily 72h` to cover a weekend. Claude
+reads the report, checks the top items against your code and live evidence,
+shows a table of what is real (anything that came back after a fix first),
+records a verdict for each item, and asks which ones to fix. It changes code
+only for the items you pick and opens a pull request only when you ask.
+
+**Codex.** Codex reads the same three tools (`libra_coding_report`,
+`libra_feed`, `libra_record_triage`) through Libra's remote MCP server. Codex
+sends the key from an environment variable and stores only the variable's name,
+so put the export in the shell profile Codex starts from, then register the
+server once. `YOUR_LIBRA_API_KEY` is the same key `/libra-login` asks for.
+
+```bash
+export LIBRA_API_TOKEN=YOUR_LIBRA_API_KEY
+codex mcp add libra --url https://api.libra.exla.ai/mcp --bearer-token-env-var LIBRA_API_TOKEN
+```
+
+The same server written directly in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.libra]
+url = "https://api.libra.exla.ai/mcp"
+bearer_token_env_var = "LIBRA_API_TOKEN"
+```
+
+`codex mcp list` shows the server. If you also use this plugin, keep one key:
+its hooks read `LIBRA_API_TOKEN` before the key `/libra-login` stored. In a new
+Codex session, ask for "Libra's coding report for this repo; verify the top
+items and tell me what is real". For the full `/libra-daily` steps, save this
+plugin's `commands/libra-daily.md` as `~/.agents/skills/libra-daily/SKILL.md`
+(or `.agents/skills/libra-daily/SKILL.md` in the repository) and run
+`$libra-daily`. Where the skill mentions `/libra-login`, the Codex setup above
+applies instead.
+
+**Plain HTTP.** Without MCP, read the report with curl:
+
+```bash
+curl -sS -H "Authorization: Bearer $LIBRA_API_TOKEN" \
+  "https://api.libra.exla.ai/developer-sessions/coding-report?repo=OWNER/REPO&sinceHours=24"
+```
+
+Add `&format=json` for JSON. `GET /developer-sessions/feed` returns the same
+items as JSON pages (pass `nextCursor` back as `cursor`), and `ids=ID1,ID2` (up
+to 20) returns full detail for those items. Record verdicts with
+`POST /developer-sessions/triage`:
+
+```bash
+curl -sS -H "Authorization: Bearer $LIBRA_API_TOKEN" -H 'content-type: application/json' \
+  -d '{"repo":"OWNER/REPO","items":[{"id":"ITEM_ID","verdict":"real","note":"one line why"}]}' \
+  https://api.libra.exla.ai/developer-sessions/triage
+```
+
+A 404 `not_found` means the report is not enabled for your account, 403
+`feed_not_enabled` means it is not enabled for that repo, and 404
+`repo_not_found` means your key cannot see that repo. Each user gets 60 report
+and feed reads and 60 verdict requests every 10 minutes; past that, Libra
+answers 429 `rate_limited` with a `Retry-After` header, and over MCP the tool
+returns `rate_limited`. Paging usually stays stable while you walk: for 10
+minutes, later pages come from the items the first page read, so items that
+arrive mid-walk show up on the next first page instead of shifting the pages
+you are on. Later pages read the tables again, and can shift, when that first
+read is gone: after 10 minutes, when Libra is serving more than 8 walks at once,
+after a restart or deploy, or when the first page was built while a source was
+failing. Verdicts are always read fresh, so recording triage mid-walk can move
+an item across a page boundary: it may show twice, or not until your next walk.
+
+**Verdicts hide what is settled.** Each item gets one verdict: `real`,
+`not_real`, `expected`, `needs_info`, `duplicate` (naming the item it
+duplicates), `fixing` (with the PR number), or `fixed` (once the fix is
+deployed). The next report hides items marked `not_real`, `expected`,
+`duplicate`, or `fixed`, listing up to 10 of them under Settled earlier, moves
+`real` and `fixing` items to Tracking, and keeps `needs_info` items in Needs
+triage. A hidden item comes back on its own: a `fixed` item seen again after the
+verdict lands under Came back after a fix, and a dismissed item returns to Needs
+triage when it gets more severe or Libra alerts your team about it after the
+verdict. Verdicts are per repository and shared by everyone on your team. Only
+verdicts you confirmed change how Libra scores its own detectors, so the agent
+records its own verdicts as unconfirmed and re-records the ones you agree with.
+
 ## Feedback
 
 `/libra-feedback useful`, `/libra-feedback not useful <why>`, or
@@ -476,6 +577,8 @@ Implemented in this package:
   `/libra-feedback`.
 - Libra's PR review in the live session: a watching line, the finished review for you and
   Claude, and one Stop reminder per review with issues (Claude Code only).
+- `/libra-daily` (plugin 2.0.3) for Libra's daily coding report, with verdicts recorded back
+  to Libra; Codex reads the same report through the remote MCP server.
 
 Still planned:
 - First-class distribution docs and a published install URL.
