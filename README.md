@@ -233,7 +233,7 @@ did not complete, or a missing answer all stay silent.
 **Session start: only when something is new in production**
 
 ```text
-Libra · new in cedar-mail production
+Libra · new in acme-api production
   - User executions fail before they start because connection tokens are missing (P2, started 3h ago)
   - 1 fix PR to review: /libra-review
   Claude has the details.
@@ -269,7 +269,7 @@ shows the same block. At most two findings are listed, then `+N more`. A clean c
 is one line:
 
 ```text
-Libra · commit check · nothing flagged against CedarCopilot/cedar-mail production history
+Libra · commit check · nothing flagged against acme/acme-api production history
 ```
 
 At most once a day, one of these blocks ends with `  Useful? Reply with /libra-feedback`.
