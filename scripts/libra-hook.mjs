@@ -12,7 +12,7 @@ const MAX_EVENTS_PER_POST = 50;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "2.0.5";
+const PLUGIN_VERSION = "2.0.6";
 const MAX_PENDING_SURFACED = 50;
 // Fast updates (see runNewestInstalledCopy): where this copy lives, how often
 // a hook may ask Claude Code to refresh the plugin, and the size cap for
@@ -887,48 +887,68 @@ function finishDeliveryTurn(id, input) {
   const tasks = input.background_tasks;
   saveDeliveryState(id, { stoppedAt: Date.now(), stopBackground: Array.isArray(tasks) ? tasks.length > 0 : Boolean(tasks) });
 }
-// A later file mtime can be a snapshot or duration record, not a new turn.
-// Establish a timestamped conversation anchor at/before the boundary before
-// ignoring a passive append. Unknown or incomplete tails remain busy.
+// Claude Code keeps appending bookkeeping after a turn ends: request blobs,
+// titles, modes, queue and hook records, often without a timestamp and
+// sometimes larger than one read. None of it starts a coding turn, so walk back
+// over it until a conversation record at or before the boundary anchors the
+// read. Only a later user prompt or assistant message continues the turn. A
+// malformed message, or a read that never reaches an anchor, stays busy.
+const TRANSCRIPT_SCAN_BYTES = 4 * 1024 * 1024;
+const TRANSCRIPT_CHUNK_BYTES = 65_536;
+const TRANSCRIPT_CONVERSATION_TYPES = new Set(["user", "assistant", "system"]);
+// Local command echoes and shell escapes are written as user records, but the
+// model does not answer them.
+const TRANSCRIPT_LOCAL_INPUT = /^<(?:local-command-[a-z]+|bash-(?:input|stdout|stderr))>/;
+function transcriptLineAfter(line, boundaryMs) {
+  const head = /^\{"type":"([^"]*)"/.exec(line);
+  if (head && !TRANSCRIPT_CONVERSATION_TYPES.has(head[1])) return "skip";
+  const record = JSON.parse(line);
+  if (!isRecord(record)) return "busy";
+  const at = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : NaN;
+  if (record.type === "system") return Number.isFinite(at) && at <= boundaryMs ? "anchor" : "skip";
+  if (record.type !== "user" && record.type !== "assistant") return "skip";
+  if (!isRecord(record.message) || !Number.isFinite(at)) return "busy";
+  if (at <= boundaryMs) return "anchor";
+  if (record.type === "user" && (record.isMeta === true
+    || (typeof record.message.content === "string" && TRANSCRIPT_LOCAL_INPUT.test(record.message.content)))) return "skip";
+  return "busy";
+}
 function transcriptContinuedAfter(transcriptPath, boundaryMs) {
   if (!transcriptPath) return false;
   let fd;
   try {
     fd = fs.openSync(transcriptPath, "r");
-    const before = fs.fstatSync(fd);
-    if (!before.isFile()) return true;
-    if (before.mtimeMs <= boundaryMs) return false;
-    const length = Math.min(before.size, 65_536);
-    if (!length) return true;
-    const buffer = Buffer.alloc(length);
-    const offset = before.size - length;
-    if (fs.readSync(fd, buffer, 0, length, offset) !== length) return true;
-    const after = fs.fstatSync(fd);
-    if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) return true;
-    let text = buffer.toString("utf8");
-    if (offset > 0) {
-      const firstBreak = text.indexOf("\n");
-      if (firstBreak < 0) return true;
-      text = text.slice(firstBreak + 1);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) return true;
+    if (stat.mtimeMs <= boundaryMs) return false;
+    if (!stat.size) return true;
+    const floor = Math.max(0, stat.size - TRANSCRIPT_SCAN_BYTES);
+    let end = stat.size;
+    let carry = Buffer.alloc(0);
+    while (end > floor) {
+      const start = Math.max(floor, end - TRANSCRIPT_CHUNK_BYTES);
+      const chunk = Buffer.alloc(end - start);
+      if (fs.readSync(fd, chunk, 0, chunk.length, start) !== chunk.length) return true;
+      const buffer = carry.length ? Buffer.concat([chunk, carry]) : chunk;
+      end = start;
+      // Everything before the first newline may be the tail of an earlier
+      // line, unless the read has reached the start of the file.
+      let lineEnd = buffer.length;
+      for (;;) {
+        const newline = lineEnd > 0 ? buffer.lastIndexOf(0x0a, lineEnd - 1) : -1;
+        if (newline < 0 && start > 0) break;
+        const line = buffer.subarray(newline + 1, lineEnd).toString("utf8").trim();
+        lineEnd = Math.max(newline, 0);
+        if (line) {
+          const verdict = transcriptLineAfter(line, boundaryMs);
+          if (verdict === "anchor") return false;
+          if (verdict === "busy") return true;
+        }
+        if (newline < 0) break;
+      }
+      carry = buffer.subarray(0, lineEnd);
     }
-    let anchored = false;
-    for (const line of text.split(/\r?\n/).filter((line) => line.trim())) {
-      const record = JSON.parse(line);
-      if (!isRecord(record)) return true;
-      const timestamp = record.timestamp ?? (record.type === "file-history-snapshot" ? record.snapshot?.timestamp : null);
-      const at = typeof timestamp === "string" ? Date.parse(timestamp) : NaN;
-      if (!Number.isFinite(at)) return true;
-      if (record.type === "user" || record.type === "assistant") {
-        if (!isRecord(record.message)) return true;
-        if (at > boundaryMs) return true;
-        anchored = true;
-      } else if (record.type === "file-history-snapshot"
-        || (record.type === "system" && ["turn_duration", "stop_hook_summary"].includes(record.subtype))) {
-        // These records describe saved files or a completed turn. They cannot
-        // independently start a new coding turn.
-      } else return true;
-    }
-    return !anchored;
+    return true;
   } catch { return true; }
   finally { if (fd != null) try { fs.closeSync(fd); } catch {} }
 }
@@ -957,9 +977,13 @@ function readHeldV2(id) {
     }
     return (Array.isArray(raw.items) ? raw.items : []).filter((item) => isRecord(item) && typeof item.id === "string" && typeof item.key === "string" && DELIVERY_WHEN.has(item.when))
       .slice(0, 50).map((item) => ({ id: cleanField(item.id, 300, { label: true }), key: cleanField(item.key, 80, { label: true }), when: item.when,
-        since: Number(item.since), ttlMs: Math.min(Number(item.ttlMs) || 0, deliveryPolicy(id).heldMaxMs), ...(item.interrupt === true ? { interrupt: true } : {}) }));
+        since: Number(item.since), ttlMs: Math.min(Number(item.ttlMs) || 0, deliveryPolicy(id).heldMaxMs), ...(item.interrupt === true ? { interrupt: true } : {}), ...(item.wake === false ? { wake: false } : {}) }));
   } catch { return []; }
 }
+// Only a held note that may wake the session is worth a spontaneous read: a
+// no-wake note waits for the next hook. Entries written before 2.0.6 count.
+function heldCanWake(item) { return item.interrupt === true || item.wake !== false; }
+function heldWake(block) { return block.delivery.wake ? {} : { wake: false }; }
 function pluginReportV2(body) {
   const id = String(body.sessionId || "");
   const state = readDeliveryState(id);
@@ -1087,7 +1111,7 @@ function deliverNotesV2(point, response, context, input = {}, fromCache = false)
       const reason = point === "SessionStart" && input.source === "compact" && block.items.some((item) => item.once) ? "compact" : !hasOutput ? "cannot_show" : policy.quiet ? "quiet" : spontaneous && phase === "working" && !block.delivery.interrupt ? "mid_turn" : spontaneous && !block.delivery.wake ? "wake_disabled"
         : point === "Stop" && isFlagSet(input.stop_hook_active ?? input.stopHookActive) ? "stop_hook_active" : !allowed ? "timing" : null;
       if (reason) {
-        for (const item of block.items.filter((item) => item.id)) if (!held.some((entry) => entry.id === item.id && entry.key === block.key)) held.push({ id: item.id, key: block.key, when, since: now, ttlMs: block.delivery.ttlMs, ...(block.delivery.interrupt ? { interrupt: true } : {}) });
+        for (const item of block.items.filter((item) => item.id)) if (!held.some((entry) => entry.id === item.id && entry.key === block.key)) held.push({ id: item.id, key: block.key, when, since: now, ttlMs: block.delivery.ttlMs, ...(block.delivery.interrupt ? { interrupt: true } : {}), ...heldWake(block) });
         deliveryReceipt(context, block, "held", reason, block.items.map((item) => item.id).filter(Boolean));
       } else picked.push(block);
     }
@@ -1096,7 +1120,7 @@ function deliverNotesV2(point, response, context, input = {}, fromCache = false)
     if (spontaneous && deliveryPhase(id) === "working") {
       const waiting = picked.filter((block) => !block.delivery.interrupt);
       for (const block of waiting) {
-        for (const item of block.items.filter((item) => item.id)) if (!held.some((entry) => entry.id === item.id && entry.key === block.key)) held.push({ id: item.id, key: block.key, when: block.delivery.when, since: now, ttlMs: block.delivery.ttlMs });
+        for (const item of block.items.filter((item) => item.id)) if (!held.some((entry) => entry.id === item.id && entry.key === block.key)) held.push({ id: item.id, key: block.key, when: block.delivery.when, since: now, ttlMs: block.delivery.ttlMs, ...heldWake(block) });
         deliveryReceipt(context, block, "held", "mid_turn", block.items.map((item) => item.id));
       }
       picked.splice(0, picked.length, ...picked.filter((block) => block.delivery.interrupt));
@@ -1154,7 +1178,7 @@ function deliverNotesV2(point, response, context, input = {}, fromCache = false)
     // and physically written the result. An aborted emit restores only claims
     // owned by this process, and leaves IDs for a fresh server revalidation.
     for (const block of rendered.map(({ block }) => block)) for (const item of block.items.filter((item) => item.id && delivered.includes(item.id))) {
-      if (!held.some((entry) => entry.id === item.id && entry.key === block.key)) held.push({ id: item.id, key: block.key, when: block.delivery.when, since: now, ttlMs: block.delivery.ttlMs });
+      if (!held.some((entry) => entry.id === item.id && entry.key === block.key)) held.push({ id: item.id, key: block.key, when: block.delivery.when, since: now, ttlMs: block.delivery.ttlMs, ...heldWake(block) });
     }
     writeFileAtomic(heldNotesPath(id), JSON.stringify({ contract: 2, items: held.slice(-50) }));
     if (!output) { rollbackDeliveryClaims(claimed); return null; }
@@ -2138,7 +2162,7 @@ async function runMonitorTick() {
   try { state = JSON.parse(fs.readFileSync(statePath, "utf8")) || {}; } catch {}
   const lastActive = Number(readDeliveryState(sessionExternalId).promptedAt || 0) || null;
   const policy = deliveryPolicy(sessionExternalId);
-  const heldDue = readHeldV2(sessionExternalId).some((item) => item.interrupt || (deliveryPhase(sessionExternalId, now) !== "working" && (item.when !== "when_done" || deliveryPhase(sessionExternalId, now) === "done")));
+  const heldDue = readHeldV2(sessionExternalId).filter(heldCanWake).some((item) => item.interrupt || (deliveryPhase(sessionExternalId, now) !== "working" && (item.when !== "when_done" || deliveryPhase(sessionExternalId, now) === "done")));
   const newsDue = heldDue || (lastActive != null && now - lastActive < policy.activeWindowMs && now - Number(state.lastNewsAt || 0) >= policy.newsEveryMs);
   const investigations = readInvestigations(sessionExternalId);
   if (!watched.length && !newsDue && !investigations.length) {
@@ -2389,7 +2413,7 @@ async function runWatch() {
   const repoInfo = resolveRepo(cwd);
   if (repoInfo.source === "local") return;
   const sessionExternalId = String(input.session_id || input.sessionId || process.env.CLAUDE_CODE_SESSION_ID || "");
-  if (!sessionExternalId || (!readWatchedPrs(sessionExternalId).length && !readInvestigations(sessionExternalId).length && !readHeldV2(sessionExternalId).length)) return;
+  if (!sessionExternalId || (!readWatchedPrs(sessionExternalId).length && !readInvestigations(sessionExternalId).length && !readHeldV2(sessionExternalId).some(heldCanWake))) return;
   // The session monitor delivers reviews while the session runs, idle or not.
   if (monitorAlive(sessionExternalId)) return;
   if (!versionAtLeast(claudeCodeVersion(input.transcript_path), MIN_ASYNC_REWAKE_VERSION)) return;
@@ -2403,7 +2427,7 @@ async function runWatch() {
     while (Date.now() < deadline) {
       const watchedPrs = readWatchedPrs(sessionExternalId);
       const investigations = readInvestigations(sessionExternalId);
-      if (!watchedPrs.length && !investigations.length && !readHeldV2(sessionExternalId).length) return;
+      if (!watchedPrs.length && !investigations.length && !readHeldV2(sessionExternalId).some(heldCanWake)) return;
       touchWatcherLock(lock);
       const response = await postJson(`${credentials.api}/developer-sessions/events`, credentials.token, {
         sessionId: sessionExternalId,
@@ -2421,7 +2445,7 @@ async function runWatch() {
         const emitted = await emitDeliveryV2([wake], "watcher");
         if (emitted) { releaseWatcherLock(lock); process.exit(2); }
       }
-      if (response && polls > WATCH_GRACE_POLLS && !entries.some((entry) => entry.state === "reviewing") && !investigations.length && !readHeldV2(sessionExternalId).length) return;
+      if (response && polls > WATCH_GRACE_POLLS && !entries.some((entry) => entry.state === "reviewing") && !investigations.length && !readHeldV2(sessionExternalId).some(heldCanWake)) return;
       await new Promise((resolve) => setTimeout(resolve, Math.min(deliveryPolicy(sessionExternalId).watcherPollMs, Math.max(0, deadline - Date.now()))));
     }
   } finally {
@@ -2478,6 +2502,10 @@ function releaseWatcherLock(lock) {
 
 // Two producers can speak in one hook (a prompt match and a finished review):
 // their visible text and Claude context are joined, never one dropped.
+// Claude Code reads one hookSpecificOutput per hook. Contexts are joined and
+// the most restrictive permission decision wins with its reasons, so a commit
+// check's approval prompt survives context delivered by the events answer.
+const PERMISSION_RANK = { allow: 1, ask: 2, deny: 3 };
 function mergeHookOutput(first, second, hookEvent) {
   if (!second) return first;
   if (!first) {
@@ -2487,10 +2515,21 @@ function mergeHookOutput(first, second, hookEvent) {
   const out = { ...first };
   const messages = [first.systemMessage, second.systemMessage].filter(Boolean);
   if (messages.length) out.systemMessage = messages.join("\n");
-  const contexts = [first.hookSpecificOutput?.additionalContext, second.hookSpecificOutput?.additionalContext].filter(Boolean);
-  if (contexts.length) {
-    out.hookSpecificOutput = { ...(first.hookSpecificOutput || {}), hookEventName: first.hookSpecificOutput?.hookEventName || hookEvent, additionalContext: contexts.join("\n\n") };
+  const a = first.hookSpecificOutput, b = second.hookSpecificOutput;
+  if (!a && !b) return out;
+  const merged = { ...(a || {}), hookEventName: a?.hookEventName || b?.hookEventName || hookEvent };
+  const contexts = [a?.additionalContext, b?.additionalContext].filter(Boolean);
+  if (contexts.length) merged.additionalContext = contexts.join("\n\n");
+  const rankA = PERMISSION_RANK[a?.permissionDecision] || 0, rankB = PERMISSION_RANK[b?.permissionDecision] || 0;
+  if (rankB > rankA) {
+    merged.permissionDecision = b.permissionDecision;
+    if (b.permissionDecisionReason) merged.permissionDecisionReason = b.permissionDecisionReason;
+    else delete merged.permissionDecisionReason;
+  } else if (rankB && rankB === rankA) {
+    const reasons = [a.permissionDecisionReason, b.permissionDecisionReason].filter(Boolean);
+    if (reasons.length) merged.permissionDecisionReason = reasons.join("\n\n");
   }
+  out.hookSpecificOutput = merged;
   return out;
 }
 

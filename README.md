@@ -134,6 +134,20 @@ that share terms with the command, then the top of the list. It asks at most
 once per session every 10 minutes and shows nothing on screen; the agent decides
 whether any of it bears on the work.
 
+## 2.0.6 Commit approvals and turn ends
+
+- A commit check that needs your approval now always asks for it. When the same
+  hook also gave Claude other context, such as a PR review, the approval prompt
+  could be lost while the finding still showed. The hook now keeps the strictest
+  decision and both pieces of context.
+- The plugin can tell again when Claude has finished a turn. Claude Code writes
+  bookkeeping records to the transcript after a turn ends (request records,
+  titles, modes, queue and status records), and the plugin read any of them as
+  Claude still working, so a note meant for the end of a turn waited. Only a
+  later prompt or a reply from Claude now counts as more work.
+- A held note that may not interrupt you no longer makes the session monitor ask
+  Libra again on every tick. It waits for the next hook.
+
 ## Updating
 
 Third-party marketplaces do not auto-update by default. Turn it on once in

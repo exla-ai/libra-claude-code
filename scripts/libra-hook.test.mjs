@@ -1239,7 +1239,7 @@ test("A tool call records locally and returns at once; a background sender posts
     assert.equal(sent.length, 6, "every tool event reached the server");
     assert.ok(requests.length <= 3, `a burst goes out in a few batches, not one per hook: ${requests.length}`);
     assert.ok(sent.every((e) => /^[0-9a-f]{40}$/.test(e.sourceHead || "") || e.sourceHead === null), "the sender stamps the head it sees");
-    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.5");
+    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.6");
   });
 });
 
@@ -1356,7 +1356,7 @@ test("v2 sends capabilities and state, uses server prose once, and keeps Codex c
     assert.match(shown.hookSpecificOutput.additionalContext, /3 requests returned 500/);
     assert.doesNotMatch(shown.hookSpecificOutput.additionalContext, /\*\*Libra flagged/);
     assert.equal(requests[0].body.plugin.contract, 2);
-    assert.equal(requests[0].body.plugin.version, "2.0.5");
+    assert.equal(requests[0].body.plugin.version, "2.0.6");
     assert.equal(requests[0].body.plugin.state.phase, "working");
     assert.ok(requests[0].body.plugin.capabilities.hooks.includes("Stop"));
     assert.equal((await runHook({ api, home, cwd: repo, input: { ...input, session_id: "another-window" } })).stdout, "");
@@ -1517,6 +1517,38 @@ test("v2 local failure and subagent caches use server blocks, expire, and clear 
     reply = v2Answer([], { evaluated: ["subagent", "failure"] });
     await runHook({ api, home, cwd: repo, input: { ...base, hook_event_name: "UserPromptSubmit", prompt: "continue" } });
     assert.equal((await runHook({ api, home, cwd: repo, input: { ...base, hook_event_name: "SubagentStart", agent_type: "general" } })).stdout, "");
+  });
+});
+
+test("v2 commit approval survives context the events answer delivers on the same hook", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-"));
+  const review = v2BlockFixture({ key: "pr_review", id: "review-1", header: undefined, line: undefined, context: ["SERVER-REVIEW-CONTEXT"] });
+  const note = v2BlockFixture({ key: "commit_check", id: "", once: false, pause: true, context: ["SERVER-COMMIT-EVIDENCE"], line: "SERVER-COMMIT-FINDING" });
+  await withApi({ [EVENTS]: () => v2Answer([review]), "commit-check": () => v2Answer([note]) }, async (api) => {
+    const out = JSON.parse((await runHook({ api, home, cwd: repo, input: { ...bash("v2-commit-merge", repo, "git commit -m test"), hook_event_name: "PreToolUse" } })).stdout);
+    assert.equal(out.hookSpecificOutput.hookEventName, "PreToolUse");
+    assert.equal(out.hookSpecificOutput.permissionDecision, "ask");
+    assert.match(out.hookSpecificOutput.permissionDecisionReason, /SERVER-COMMIT-EVIDENCE/);
+    assert.match(out.hookSpecificOutput.additionalContext, /SERVER-REVIEW-CONTEXT/);
+    assert.match(out.systemMessage, /SERVER-COMMIT-FINDING/);
+  });
+});
+
+test("v2 monitor does not poll for a held note that cannot wake the session", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-")), sid = "v2-nowake";
+  await withApi({ [MONITOR]: () => v2Answer([v2BlockFixture({ wake: false })]), [EVENTS]: () => v2Answer([]) }, async (api, requests) => {
+    seedV2State(home, sid);
+    const ticks = () => requests.filter((r) => r.url === MONITOR);
+    assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "");
+    assert.equal(ticks().length, 1);
+    const held = readHeldFixture(home, sid);
+    assert.deepEqual(held.items.map((item) => [item.id, item.wake]), [["note-v2", false]]);
+    await runMonitor({ api, home, cwd: repo, sid });
+    assert.equal(ticks().length, 1, "a no-wake note waits for the next hook instead of a read every tick");
+    held.items = held.items.map(({ wake, ...item }) => item);
+    fs.writeFileSync(path.join(path.dirname(v2StateFile(home, sid)), `${sessionHash(sid)}.held.json`), JSON.stringify(held));
+    await runMonitor({ api, home, cwd: repo, sid });
+    assert.equal(ticks().at(-1)?.body.risks, true, "a note held before 2.0.6 still counts");
   });
 });
 
@@ -1700,7 +1732,7 @@ test("v2 old launch handoff reports original wiring and never prints from a lega
     const env = { LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test", LIBRA_HOOK_FLUSH: "inline" };
     const shown = await runInstalled({ ...install, env, input: { hook_event_name: "SessionStart", source: "startup", session_id: "old-v2-handoff", cwd: repo } });
     assert.match(shown.stdout, /Measured request failures/);
-    assert.equal(requests[0].body.plugin.version, "2.0.5");
+    assert.equal(requests[0].body.plugin.version, "2.0.6");
     assert.equal(requests[0].body.plugin.capabilities.launchVersion, "0.7.1");
     assert.deepEqual(requests[0].body.plugin.capabilities.hooks, ["SessionStart", "PostToolUse"]);
     const background = await runInstalled({ ...install, env, args: ["claude-code", "async"], input: { hook_event_name: "PostToolUse", session_id: "old-v2-handoff", cwd: repo, tool_name: "Bash", tool_input: { command: "gh pr checks 42" } } });
@@ -1814,6 +1846,40 @@ test("v2 passive transcript appends cannot permanently strand a freshly revalida
   });
 });
 
+test("v2 bookkeeping Claude Code appends after a turn ends does not keep the session working", async () => {
+  // Claude Code 2.1 writes request blobs, titles, modes, queue, hook and
+  // status records after Stop. Many carry no timestamp, a request blob can be
+  // far larger than one read, and new record types keep appearing.
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-")), sid = "v2-bookkeeping-tail";
+  const transcript = path.join(repo, "bookkeeping.jsonl");
+  const old = new Date(Date.now() - 180_000).toISOString(), now = new Date().toISOString();
+  const tail = [
+    { type: "assistant", timestamp: old, message: { role: "assistant", content: [{ type: "text", text: "Done." }] } },
+    { type: "system", subtype: "stop_hook_summary", timestamp: now },
+    { type: "api-request", timestamp: now, requestId: "req_1" },
+    { type: "api-request-blob", requestId: "req_1", blob: "x".repeat(300_000) },
+    { type: "last-prompt", prompt: "abc" },
+    { type: "cost-state", costUsd: 0.1 },
+    { type: "queue-operation", operation: "dequeue", timestamp: now },
+    { type: "bridge-session", id: "b" },
+    { type: "atis-latch", on: true },
+    { type: "ai-title", title: "t" },
+    { type: "mode", mode: "default" },
+    { type: "permission-mode", permissionMode: "default" },
+    { type: "system", subtype: "bridge_status", timestamp: now },
+    { parentUuid: "p", attachment: { type: "hook_success" }, type: "attachment", timestamp: now },
+    { type: "user", isMeta: true, timestamp: now, message: { role: "user", content: "<local-command-caveat>Caveat</local-command-caveat>" } },
+    { type: "user", timestamp: now, message: { role: "user", content: "<local-command-stdout>Total cost: $0.10</local-command-stdout>" } },
+    { type: "some-future-record", timestamp: now },
+  ];
+  fs.writeFileSync(transcript, tail.map((record) => JSON.stringify(record)).join("\n") + "\n");
+  await withApi({ [MONITOR]: () => v2Answer([v2BlockFixture({ when: "when_done", wake: true, context: ["AFTER-BOOKKEEPING"] })]) }, async (api) => {
+    seedWatch(home, sid);
+    seedV2State(home, sid, { shippedAt: Date.now() - 150_000, transcriptPath: transcript });
+    assert.match((await runMonitor({ api, home, cwd: repo, sid })).stdout, /AFTER-BOOKKEEPING/);
+  });
+});
+
 test("v2 actual transcript turns and incomplete transcript evidence still prevent spontaneous delivery", async () => {
   const repo = makeRepo();
   const stoppedAt = Date.now() - 120_000;
@@ -1822,10 +1888,10 @@ test("v2 actual transcript turns and incomplete transcript evidence still preven
     ["assistant continuation during Stop settle interval", old + JSON.stringify({ type: "assistant", timestamp: new Date(stoppedAt + 50).toISOString(), message: { role: "assistant", content: [{ type: "tool_use", id: "within-settle", name: "Bash", input: { command: "npm test" } }] } })],
     ["assistant continuation", old + JSON.stringify({ type: "assistant", timestamp: new Date().toISOString(), message: { role: "assistant", content: [{ type: "tool_use", id: "new-call", name: "Bash", input: { command: "npm test" } }] } })],
     ["tool result", old + JSON.stringify({ type: "user", timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "new-call", content: "The command finished." }] } })],
-    ["unknown record", old + JSON.stringify({ type: "unknown-new-event", timestamp: new Date().toISOString() })],
+    ["developer prompt after bookkeeping", old + JSON.stringify({ type: "api-request-blob", blob: "x".repeat(90_000) }) + "\n" + JSON.stringify({ type: "user", timestamp: new Date().toISOString(), message: { role: "user", content: "Now add the retry." } })],
     ["missing timestamp", old + JSON.stringify({ type: "assistant", message: { role: "assistant", content: [] } })],
     ["malformed tail", old + '{"type":"assistant"'],
-    ["truncated history without anchor", old + Array.from({ length: 1800 }, () => JSON.stringify({ type: "file-history-snapshot", snapshot: { timestamp: new Date().toISOString(), trackedFileBackups: {} } })).join("\n")],
+    ["bookkeeping longer than the read budget", old + JSON.stringify({ type: "api-request-blob", blob: "x".repeat(4_300_000) })],
     ["unreadable transcript", null],
   ];
   await withApi({ [MONITOR]: () => v2Answer([v2BlockFixture({ when: "when_done", wake: true })]) }, async (api) => {
