@@ -1,7 +1,7 @@
 ---
 name: libra-feedback
 allowed-tools: 'Bash(node "${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs" feedback:*)'
-description: Tell the Libra team whether Libra helped. Sends a short rating and note about the last thing Libra showed in this coding session (a commit check, production context, or the session-start summary).
+description: Tell the Libra team whether Libra helped. Sends a short rating and note about the last thing Libra put in front of the developer in this coding session (a commit check, production context, or the session-start summary).
 ---
 
 # /libra-feedback

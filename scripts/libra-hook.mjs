@@ -12,7 +12,7 @@ const MAX_EVENTS_PER_POST = 50;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "2.0.3";
+const PLUGIN_VERSION = "2.0.4";
 const MAX_PENDING_SURFACED = 50;
 // Fast updates (see runNewestInstalledCopy): where this copy lives, how often
 // a hook may ask Claude Code to refresh the plugin, and the size cap for
@@ -340,11 +340,37 @@ async function localHook(lane, { input, hookEvent, config, agent, cwd, sessionEx
 
 function readJsonFromStdin() {
   try {
-    const raw = fs.readFileSync(0, "utf8");
+    const raw = readStdinSync();
     return raw.trim() ? JSON.parse(raw) : null;
   } catch {
     return null;
   }
+}
+
+// fs.readFileSync(0) throws EAGAIN when stdin is a non-blocking pipe whose
+// writer has not written yet, and drops what it already read. Read until EOF,
+// waiting briefly on EAGAIN, so a slow writer is not taken for empty input.
+function readStdinSync(maxWaitMs = 3_000) {
+  const chunks = [];
+  const buf = Buffer.alloc(64 * 1024);
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + maxWaitMs;
+  for (;;) {
+    let n;
+    try {
+      n = fs.readSync(0, buf, 0, buf.length, null);
+    } catch (err) {
+      if (err?.code === "EAGAIN" && Date.now() < deadline) {
+        Atomics.wait(sleeper, 0, 0, 10);
+        continue;
+      }
+      if (err?.code === "EOF" || err?.code === "EAGAIN") break;
+      throw err;
+    }
+    if (n === 0) break;
+    chunks.push(Buffer.from(buf.subarray(0, n)));
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 function readCredentials() {
@@ -1013,7 +1039,7 @@ function deliverNotesV2(point, response, context, input = {}, fromCache = false)
       delivered.push(...items.map((item) => item.id));
       deliveredLegacy.push(...items.flatMap((item) => item.legacyRiskIds));
       if (items.length || out.contextLines.length || out.message) staged.push({ kind: block.kind, visibleText: out.message || "", outcome: "delivered", key: block.key, when: block.delivery.when, to: block.delivery.to, channel: point === "monitor" ? "notify" : point === "watcher" ? "rewake" : point === "Stop" ? "stop_block" : block.pause && point === "PreToolUse" ? "pause" : out.message ? "show" : "tell", heldMs: Math.max(0, ...items.map((item) => now - (held.find((entry) => entry.id === item.id)?.since ?? now))),
-        titles: items.length ? items.map((item) => item.title).filter(Boolean) : block.titles, noteIds: items.map((item) => item.id), contract: 2, deliveryPoint: point, phase, policyRev: policy.rev });
+        titles: items.length ? items.map((item) => item.title).filter(Boolean) : block.titles, noteIds: items.map((item) => item.id), contract: 2, deliveryPoint: point, phase, policyRev: policy.rev, reinject: point === "SessionStart" && input.source === "compact" });
     }
     const lines = rendered.flatMap(({ out }) => out.contextLines);
     const howTo = [...new Set(rendered.map(({ block }) => block.howTo).filter(Boolean))].join(" ");
@@ -1388,6 +1414,9 @@ function shortRepo(repo) {
 // remembered well past that.
 const SHOWN_RISK_MEMORY_MS = 7 * 24 * 60 * 60 * 1000;
 
+// Notes that never reach the developer's conversation, even through their agent.
+const AGENT_ONLY_KINDS = new Set(["subagent_context", "investigation_started"]);
+
 // Everything Libra shows is recorded, so usefulness can be measured against
 // what the developer actually saw. Queued locally, one file per event, and sent
 // with the next batch.
@@ -1413,9 +1442,11 @@ function recordSurfaced(context, note) {
     },
   };
   queueSurfacedEvent(context.sessionExternalId, event);
-  // `/libra-feedback` attaches to the last note the developer actually saw. A
-  // context-only note (Codex, a compaction re-inject) was never on their screen.
-  if (context.visible && note.visibleText) {
+  // `/libra-feedback` attaches to the last note the developer could be reacting
+  // to: one on their screen, or (2.0.4+) one handed to their coding agent to pass
+  // on. A subagent's context and a compaction re-inject are neither.
+  const toldToAgent = note.contract === 2 && !note.reinject && !AGENT_ONLY_KINDS.has(note.kind);
+  if ((context.visible && note.visibleText) || toldToAgent) {
     patchGlobalState({
       lastSurfaced: {
         sessionId: context.sessionExternalId,
@@ -2373,7 +2404,7 @@ function parseFeedback(text) {
 function readStdinText() {
   try {
     if (process.stdin.isTTY) return "";
-    return fs.readFileSync(0, "utf8");
+    return readStdinSync();
   } catch {
     return "";
   }

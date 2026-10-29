@@ -285,15 +285,18 @@ test("A commit check that did not complete never says nothing flagged", async ()
     const surfaced = requests.flatMap((r) => r.body.events || []).filter((e) => e.type === "libra_surfaced");
     assert.equal(surfaced.length, 0, "an unchecked result records no libra_surfaced event");
 
-    // The same hook, told the analysis completed, does say it.
+    // The same hook, told the analysis completed, tells Claude, not the screen.
     reply = { findings: [], fixOffers: [], checked: true };
     const clean = JSON.parse((await runHook({ api, home, cwd: repo, input: commit("ok") })).stdout);
-    assert.match(clean.systemMessage, /Nothing flagged against production history/);
+    assert.equal(clean.systemMessage, undefined, "a clean check is context for Claude only");
+    assert.match(clean.hookSpecificOutput.additionalContext, /the analysis completed and found nothing/);
+    assert.equal((clean.hookSpecificOutput.additionalContext.match(/Libra checked the staged change/g) || []).length, 1, "said once");
 
-    // An open fix PR on the same files is still worth saying, checked or not.
+    // An open fix PR on the same files is still worth telling Claude, checked or not.
     reply = { findings: [], fixOffers: [], note: "Libra could not analyze this commit right now.", overlappingFixPrs: [{ prNumber: 2063, title: "Cache diverges" }] };
     const overlap = JSON.parse((await runHook({ api, home, cwd: repo, input: commit("overlap") })).stdout);
-    assert.match(overlap.systemMessage, /Fix PR #2063 touches the staged files/);
+    assert.equal(overlap.systemMessage, undefined);
+    assert.match(overlap.hookSpecificOutput.additionalContext, /#2063: Cache diverges/);
   });
 });
 
@@ -485,7 +488,7 @@ test("The events POST and the commit check share one deadline and run side by si
     const run = await runHook({ api, home, cwd: repo, env, input: { hook_event_name: "PreToolUse", session_id: "sess-side-by-side", cwd: repo, tool_name: "Bash", tool_input: { command: "git commit -m x" } } });
     const elapsed = Date.now() - started;
     assert.equal(run.code, 0);
-    assert.match(JSON.parse(run.stdout).systemMessage, /Slow but real/, "back to back, the commit check would have run out of time");
+    assert.match(JSON.parse(run.stdout).hookSpecificOutput.additionalContext, /Slow but real/, "back to back, the commit check would have run out of time");
     assert.equal(arrived, 2, "both requests reached the barrier before either could answer");
     assert.ok(elapsed < 4000 + 800, `finished inside the deadline: ${elapsed}ms`);
   });
@@ -506,7 +509,7 @@ test("A server that never answers cannot hold the hook past the deadline", async
 });
 
 // ---------------------------------------------------------------------------
-// Feedback attaches only to what the developer actually saw, recently.
+// Feedback attaches to the last note the developer or their agent got, recently.
 
 async function feedbackBody(api, home, repo, requests, stdin) {
   const before = requests.length;
@@ -517,18 +520,29 @@ async function feedbackBody(api, home, repo, requests, stdin) {
   return sent.body;
 }
 
-test("/libra-feedback attaches only to a note that was shown, and only while it is recent", async () => {
+test("/libra-feedback attaches to the last note the developer or their agent got, and only while it is recent", async () => {
   const repo = makeRepo();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
   await withApi({
-    "/commit-check": () => ({ findings: [{ severity: "medium", title: "New Gmail lookup has no timeout" }], fixOffers: [] }),
+    "/commit-check": () => ({ findings: [{ severity: "high", title: "New Gmail lookup has no timeout" }], fixOffers: [] }),
     "/developer-sessions/events": () => ({ ok: true, activeRisks: RISKS, promptMatches: PROMPT_MATCHES }),
   }, async (api, requests) => {
-    // A Codex note was never on a screen, so it is nothing to attach feedback to.
-    await runHook({ api, home, cwd: repo, args: ["codex"], input: { hook_event_name: "UserPromptSubmit", session_id: "codex-hidden", cwd: repo, prompt: "why are gmail drafts missing" } });
-    const hidden = await feedbackBody(api, home, repo, requests, "useful");
-    assert.equal(hidden.events[0].payload.relatesTo, null);
-    assert.match(hidden.sessionId, /^libra-feedback-/);
+    // Before any note, there is nothing to attach feedback to.
+    const none = await feedbackBody(api, home, repo, requests, "useful");
+    assert.equal(none.events[0].payload.relatesTo, null);
+    assert.match(none.sessionId, /^libra-feedback-/);
+
+    // A note handed to Codex is what the developer heard about from their agent.
+    await runHook({ api, home, cwd: repo, args: ["codex"], input: { hook_event_name: "UserPromptSubmit", session_id: "codex-told", cwd: repo, prompt: "why are gmail drafts missing" } });
+    const codex = await feedbackBody(api, home, repo, requests, "useful");
+    assert.equal(codex.sessionId, "codex-told");
+    assert.equal(codex.events[0].payload.relatesTo.kind, "prompt_match");
+
+    // So is a Claude Code note that only Claude received.
+    await runHook({ api, home, cwd: repo, input: { hook_event_name: "UserPromptSubmit", session_id: "claude-context-only", cwd: repo, prompt: "why are gmail drafts missing again" } });
+    const contextOnly = await feedbackBody(api, home, repo, requests, "useful");
+    assert.equal(contextOnly.sessionId, "claude-context-only");
+    assert.equal(contextOnly.events[0].payload.relatesTo.kind, "prompt_match");
 
     // A note the developer saw is.
     await runHook({ api, home, cwd: repo, input: { hook_event_name: "PreToolUse", session_id: "sess-shown", cwd: repo, tool_name: "Bash", tool_input: { command: "git commit -m x" } } });
@@ -539,7 +553,7 @@ test("/libra-feedback attaches only to a note that was shown, and only while it 
     // A context-only re-inject after compaction is not a new note to rate.
     await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionStart", source: "compact", session_id: "sess-compact", cwd: repo } });
     const afterCompact = await feedbackBody(api, home, repo, requests, "useful");
-    assert.equal(afterCompact.sessionId, "sess-shown", "a hidden note does not replace the one that was shown");
+    assert.equal(afterCompact.sessionId, "sess-shown", "a re-inject does not replace the last new note");
 
     // Past a day, the note is no longer what the developer is reacting to.
     const stateFile = path.join(home, ".config/libra/coding-agent/plugin-state.json");
@@ -555,6 +569,28 @@ test("/libra-feedback attaches only to a note that was shown, and only while it 
     state.lastSurfaced.at = "not a date";
     fs.writeFileSync(stateFile, JSON.stringify(state));
     assert.equal((await feedbackBody(api, home, repo, requests, "useful")).events[0].payload.relatesTo, null);
+  });
+});
+
+test("/libra-feedback attaches to a note handed to Claude, but not to a compaction re-inject", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  const agentOnly = (key, id, title) => ({ ...v2BlockFixture({ key, id, line: "" }), header: "", items: [{ id, once: false, line: "", title, context: [`Observed: ${title}, 4 times since 09:00.`] }] });
+  let reply = v2Answer([agentOnly("prompt_match", "pm-1", "Gmail drafts failing")]);
+  await withApi({ [EVENTS]: () => reply }, async (api, requests) => {
+    const told = await runHook({ api, home, cwd: repo, input: { hook_event_name: "UserPromptSubmit", session_id: "agent-told", cwd: repo, prompt: "why are gmail drafts missing" } });
+    const out = JSON.parse(told.stdout);
+    assert.equal(out.systemMessage, undefined, "nothing on the developer's screen");
+    assert.match(out.hookSpecificOutput.additionalContext, /Gmail drafts failing/);
+    const first = await feedbackBody(api, home, repo, requests, "wrong, that was a test account");
+    assert.equal(first.sessionId, "agent-told");
+    assert.equal(first.events[0].payload.relatesTo.kind, "prompt_match");
+    assert.deepEqual(first.events[0].payload.relatesTo.titles, ["Gmail drafts failing"]);
+
+    reply = v2Answer([agentOnly("news", "news-1", "Approvals worker restarted")]);
+    const compact = await runHook({ api, home, cwd: repo, input: { hook_event_name: "SessionStart", source: "compact", session_id: "agent-compact", cwd: repo } });
+    assert.match(JSON.parse(compact.stdout).hookSpecificOutput.additionalContext, /Approvals worker restarted/, "the re-inject did reach Claude");
+    const after = await feedbackBody(api, home, repo, requests, "useful");
+    assert.equal(after.sessionId, "agent-told", "a re-inject is not a new note to rate");
   });
 });
 
@@ -637,6 +673,32 @@ test("/libra-feedback rates only explicit leading tokens and keeps everything el
       assert.equal(event.payload.rating, rating, `${JSON.stringify(text)} is ${rating}`);
       assert.equal(event.payload.note, `${note ? `${note} ` : ""}#k${index}`, `${JSON.stringify(text)} keeps the right note`);
     }
+  });
+});
+
+test("A slow writer on a non-blocking stdin is not taken for empty input", async () => {
+  const repo = makeRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-home-"));
+  await withApi({ "/developer-sessions/events": () => ({ ok: true }) }, async (api, requests) => {
+    const env = { ...process.env, HOME: home, LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test" };
+    delete env.CLAUDE_CODE_SESSION_ID;
+    // The feedback path checks process.stdin.isTTY, which opens the pipe through
+    // libuv and sets it non-blocking, so a read before the writer writes gets
+    // EAGAIN. The input arrives 400 ms after the hook starts.
+    const wrapper = `process.stdin.pause(); require("child_process").spawn(process.execPath, [${JSON.stringify(HOOK)}, "feedback"], { stdio: "inherit" }).on("exit", (code) => process.exit(code ?? 1));`;
+    const child = spawn("node", ["-e", wrapper], { cwd: repo, env, stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stdin.on("error", () => {});
+    const closed = new Promise((resolve) => child.on("close", resolve));
+    await sleep(400);
+    child.stdin.end("useful, caught it late");
+    const code = await closed;
+    assert.equal(code, 0);
+    assert.match(stdout, /thanks, your feedback \(useful\)/);
+    const sent = requests.map((r) => r.body.events?.[0]).filter((e) => e?.type === "libra_feedback");
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].payload.note, "caught it late");
   });
 });
 
@@ -1049,7 +1111,7 @@ test("A tool call records locally and returns at once; a background sender posts
     assert.equal(sent.length, 6, "every tool event reached the server");
     assert.ok(requests.length <= 3, `a burst goes out in a few batches, not one per hook: ${requests.length}`);
     assert.ok(sent.every((e) => /^[0-9a-f]{40}$/.test(e.sourceHead || "") || e.sourceHead === null), "the sender stamps the head it sees");
-    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.3");
+    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.4");
   });
 });
 
@@ -1166,7 +1228,7 @@ test("v2 sends capabilities and state, uses server prose once, and keeps Codex c
     assert.match(shown.hookSpecificOutput.additionalContext, /3 requests returned 500/);
     assert.doesNotMatch(shown.hookSpecificOutput.additionalContext, /\*\*Libra flagged/);
     assert.equal(requests[0].body.plugin.contract, 2);
-    assert.equal(requests[0].body.plugin.version, "2.0.3");
+    assert.equal(requests[0].body.plugin.version, "2.0.4");
     assert.equal(requests[0].body.plugin.state.phase, "working");
     assert.ok(requests[0].body.plugin.capabilities.hooks.includes("Stop"));
     assert.equal((await runHook({ api, home, cwd: repo, input: { ...input, session_id: "another-window" } })).stdout, "");
@@ -1501,7 +1563,7 @@ test("v2 compaction re-injects context without consuming visible once-only news"
 test("v2 old launch handoff reports original wiring and never prints from a legacy async argv", async () => {
   const current = fs.readFileSync(HOOK, "utf8");
   const install = makeInstall({ marketplaceScript: current });
-  fs.writeFileSync(install.hook, current.replace('const PLUGIN_VERSION = "2.0.3";', 'const PLUGIN_VERSION = "0.7.1";'));
+  fs.writeFileSync(install.hook, current.replace('const PLUGIN_VERSION = "2.0.4";', 'const PLUGIN_VERSION = "0.7.1";'));
   const launchRoot = path.dirname(path.dirname(install.hook));
   fs.mkdirSync(path.join(launchRoot, "hooks"), { recursive: true });
   fs.writeFileSync(path.join(launchRoot, "hooks", "hooks.json"), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command" }] }], PostToolUse: [{ hooks: [{ type: "command" }] }] } }));
@@ -1510,7 +1572,7 @@ test("v2 old launch handoff reports original wiring and never prints from a lega
     const env = { LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test", LIBRA_HOOK_FLUSH: "inline" };
     const shown = await runInstalled({ ...install, env, input: { hook_event_name: "SessionStart", source: "startup", session_id: "old-v2-handoff", cwd: repo } });
     assert.match(shown.stdout, /Measured request failures/);
-    assert.equal(requests[0].body.plugin.version, "2.0.3");
+    assert.equal(requests[0].body.plugin.version, "2.0.4");
     assert.equal(requests[0].body.plugin.capabilities.launchVersion, "0.7.1");
     assert.deepEqual(requests[0].body.plugin.capabilities.hooks, ["SessionStart", "PostToolUse"]);
     const background = await runInstalled({ ...install, env, args: ["claude-code", "async"], input: { hook_event_name: "PostToolUse", session_id: "old-v2-handoff", cwd: repo, tool_name: "Bash", tool_input: { command: "gh pr checks 42" } } });
