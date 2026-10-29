@@ -148,6 +148,21 @@ whether any of it bears on the work.
 - A held note that may not interrupt you no longer makes the session monitor ask
   Libra again on every tick. It waits for the next hook.
 
+## 2.0.7 Commit approvals reach Codex
+
+- A commit check that needs your approval used to vanish on Codex. Codex 0.165
+  does not support an approval prompt from a hook: it marked the hook failed,
+  ran the commit, and dropped everything the hook returned, including the
+  finding. On Codex the hook now stops that commit once and gives the agent the
+  finding and its evidence. The agent tells you what Libra found and asks
+  whether to go ahead. If you say yes, it runs the same commit again and Libra
+  lets it through.
+- "The same commit" means the same staged content in the same session. If the
+  staged change is different, even by one edited line, a finding that needs
+  approval stops it once more. Only a command that runs `git commit` itself is
+  stopped; a PR body or note that mentions one gets the finding as context.
+- Claude Code is unchanged: it still asks you to approve or deny.
+
 ## Updating
 
 Third-party marketplaces do not auto-update by default. Turn it on once in

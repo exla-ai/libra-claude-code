@@ -1239,7 +1239,7 @@ test("A tool call records locally and returns at once; a background sender posts
     assert.equal(sent.length, 6, "every tool event reached the server");
     assert.ok(requests.length <= 3, `a burst goes out in a few batches, not one per hook: ${requests.length}`);
     assert.ok(sent.every((e) => /^[0-9a-f]{40}$/.test(e.sourceHead || "") || e.sourceHead === null), "the sender stamps the head it sees");
-    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.6");
+    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.7");
   });
 });
 
@@ -1356,7 +1356,7 @@ test("v2 sends capabilities and state, uses server prose once, and keeps Codex c
     assert.match(shown.hookSpecificOutput.additionalContext, /3 requests returned 500/);
     assert.doesNotMatch(shown.hookSpecificOutput.additionalContext, /\*\*Libra flagged/);
     assert.equal(requests[0].body.plugin.contract, 2);
-    assert.equal(requests[0].body.plugin.version, "2.0.6");
+    assert.equal(requests[0].body.plugin.version, "2.0.7");
     assert.equal(requests[0].body.plugin.state.phase, "working");
     assert.ok(requests[0].body.plugin.capabilities.hooks.includes("Stop"));
     assert.equal((await runHook({ api, home, cwd: repo, input: { ...input, session_id: "another-window" } })).stdout, "");
@@ -1531,6 +1531,76 @@ test("v2 commit approval survives context the events answer delivers on the same
     assert.match(out.hookSpecificOutput.permissionDecisionReason, /SERVER-COMMIT-EVIDENCE/);
     assert.match(out.hookSpecificOutput.additionalContext, /SERVER-REVIEW-CONTEXT/);
     assert.match(out.systemMessage, /SERVER-COMMIT-FINDING/);
+  });
+});
+
+test("Codex stops a commit that needs approval once per staged change, then lets the same commit through", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-")), sid = "codex-pause";
+  let wording = "SERVER-COMMIT-EVIDENCE-1";
+  const note = () => v2BlockFixture({ key: "commit_check", id: "", once: false, pause: true, context: [wording], line: "SERVER-COMMIT-FINDING" });
+  const commit = (session = sid) => ({ hook_event_name: "PreToolUse", session_id: session, cwd: repo, tool_name: "Bash", tool_input: { command: "git commit -m test" } });
+  await withApi({ [EVENTS]: () => v2Answer(), "commit-check": () => v2Answer([note()]) }, async (api, requests) => {
+    const first = JSON.parse((await runHook({ api, home, cwd: repo, args: ["codex"], input: commit() })).stdout);
+    assert.equal(first.hookSpecificOutput.permissionDecision, "deny", "Codex rejects ask, so the commit is stopped with the reason");
+    assert.match(first.hookSpecificOutput.permissionDecisionReason, /SERVER-COMMIT-EVIDENCE-1/);
+    assert.match(first.hookSpecificOutput.permissionDecisionReason, /will not stop it a second time/);
+    assert.equal(first.hookSpecificOutput.additionalContext, undefined);
+    assert.equal(first.systemMessage, undefined, "Codex shows the developer nothing itself");
+
+    // The server words its findings differently on the re-run; the staged change is the same.
+    wording = "SERVER-COMMIT-EVIDENCE-2";
+    const again = JSON.parse((await runHook({ api, home, cwd: repo, args: ["codex"], input: commit() })).stdout);
+    assert.equal(again.hookSpecificOutput.permissionDecision, undefined, "the same commit run again goes ahead");
+    assert.match(again.hookSpecificOutput.additionalContext, /SERVER-COMMIT-EVIDENCE-2/);
+    assert.doesNotMatch(again.hookSpecificOutput.additionalContext, /will not stop it a second time/);
+
+    await runHook({ api, home, cwd: repo, args: ["codex"], input: { hook_event_name: "PostToolUse", session_id: sid, cwd: repo, tool_name: "Read" } });
+    assert.deepEqual(surfacedIn(requests).map((event) => event.payload.channel), ["pause", "tell"]);
+
+    // A changed staged change, or another session, is stopped again. A revised
+    // line keeps the same `--stat` shape and is still a different change.
+    fs.writeFileSync(path.join(repo, "drafts.ts"), "export const x = 2;\n");
+    spawnSync("git", ["add", "drafts.ts"], { cwd: repo, stdio: "ignore" });
+    const revised = JSON.parse((await runHook({ api, home, cwd: repo, args: ["codex"], input: commit() })).stdout);
+    assert.equal(revised.hookSpecificOutput.permissionDecision, "deny", "a revised line with the same diff shape is stopped again");
+    fs.writeFileSync(path.join(repo, "other.ts"), "export const y = 2;\n");
+    spawnSync("git", ["add", "other.ts"], { cwd: repo, stdio: "ignore" });
+    const changed = JSON.parse((await runHook({ api, home, cwd: repo, args: ["codex"], input: commit() })).stdout);
+    assert.equal(changed.hookSpecificOutput.permissionDecision, "deny");
+    const other = JSON.parse((await runHook({ api, home, cwd: repo, args: ["codex"], input: commit("codex-pause-other") })).stdout);
+    assert.equal(other.hookSpecificOutput.permissionDecision, "deny");
+  });
+});
+
+test("Codex keeps the stop when other context arrives on the same commit hook, and Claude still asks", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-"));
+  const review = v2BlockFixture({ key: "pr_review", id: "review-1", header: undefined, line: undefined, context: ["SERVER-REVIEW-CONTEXT"] });
+  const note = v2BlockFixture({ key: "commit_check", id: "", once: false, pause: true, context: ["SERVER-COMMIT-EVIDENCE"], line: "SERVER-COMMIT-FINDING" });
+  await withApi({ [EVENTS]: () => v2Answer([review]), "commit-check": () => v2Answer([note]) }, async (api) => {
+    const input = { ...bash("codex-pause-merge", repo, "git commit -m test"), hook_event_name: "PreToolUse" };
+    const codex = JSON.parse((await runHook({ api, home, cwd: repo, args: ["codex"], input })).stdout);
+    assert.equal(codex.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(codex.hookSpecificOutput.permissionDecisionReason, /SERVER-COMMIT-EVIDENCE/);
+    assert.match(codex.hookSpecificOutput.additionalContext, /SERVER-REVIEW-CONTEXT/, "the review still reaches the agent beside the stop");
+    const claude = JSON.parse((await runHook({ api, home: fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-")), cwd: repo, input: { ...input, session_id: "claude-pause-merge" } })).stdout);
+    assert.equal(claude.hookSpecificOutput.permissionDecision, "ask");
+    assert.doesNotMatch(claude.hookSpecificOutput.permissionDecisionReason, /will not stop it a second time/);
+    assert.match(claude.hookSpecificOutput.additionalContext, /SERVER-REVIEW-CONTEXT/);
+  });
+});
+
+test("Codex spends the one stop only on a command that really commits", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-")), sid = "codex-pause-mention";
+  const note = v2BlockFixture({ key: "commit_check", id: "", once: false, pause: true, context: ["SERVER-COMMIT-EVIDENCE"], line: "SERVER-COMMIT-FINDING" });
+  const run = (command) => ({ hook_event_name: "PreToolUse", session_id: sid, cwd: repo, tool_name: "Bash", tool_input: { command } });
+  await withApi({ [EVENTS]: () => v2Answer(), "commit-check": () => v2Answer([note]) }, async (api) => {
+    for (const command of ['gh pr create --title fix --body "Ran git commit after the tests"', "git commit --dry-run", "git commit-tree HEAD^{tree}"]) {
+      const out = JSON.parse((await runHook({ api, home, cwd: repo, args: ["codex"], input: run(command) })).stdout);
+      assert.equal(out.hookSpecificOutput.permissionDecision, undefined, `${command} is not stopped`);
+      assert.match(out.hookSpecificOutput.additionalContext, /SERVER-COMMIT-EVIDENCE/, `${command} still hands the agent the finding`);
+    }
+    const commit = JSON.parse((await runHook({ api, home, cwd: repo, args: ["codex"], input: run('git add -A && git commit -m "fix; tidy"') })).stdout);
+    assert.equal(commit.hookSpecificOutput.permissionDecision, "deny", "the real commit after them is still stopped once");
   });
 });
 
@@ -1732,7 +1802,7 @@ test("v2 old launch handoff reports original wiring and never prints from a lega
     const env = { LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test", LIBRA_HOOK_FLUSH: "inline" };
     const shown = await runInstalled({ ...install, env, input: { hook_event_name: "SessionStart", source: "startup", session_id: "old-v2-handoff", cwd: repo } });
     assert.match(shown.stdout, /Measured request failures/);
-    assert.equal(requests[0].body.plugin.version, "2.0.6");
+    assert.equal(requests[0].body.plugin.version, "2.0.7");
     assert.equal(requests[0].body.plugin.capabilities.launchVersion, "0.7.1");
     assert.deepEqual(requests[0].body.plugin.capabilities.hooks, ["SessionStart", "PostToolUse"]);
     const background = await runInstalled({ ...install, env, args: ["claude-code", "async"], input: { hook_event_name: "PostToolUse", session_id: "old-v2-handoff", cwd: repo, tool_name: "Bash", tool_input: { command: "gh pr checks 42" } } });

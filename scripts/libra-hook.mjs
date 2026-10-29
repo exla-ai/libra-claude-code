@@ -12,7 +12,7 @@ const MAX_EVENTS_PER_POST = 50;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "2.0.6";
+const PLUGIN_VERSION = "2.0.7";
 const MAX_PENDING_SURFACED = 50;
 // Fast updates (see runNewestInstalledCopy): where this copy lives, how often
 // a hook may ask Claude Code to refresh the plugin, and the size cap for
@@ -723,6 +723,13 @@ async function maybeRunCommitCheck(input, credentials, context) {
   const files = git(["diff", "--cached", "--name-only"], context.cwd).split(/\r?\n/).filter(Boolean).slice(0, 100);
   if (!files.length) return null;
   const diffSummary = git(["diff", "--cached", "--stat"], context.cwd).split(/\r?\n/).slice(-80).join("\n");
+  // Codex stops a real commit once per staged change, however the server
+  // words its findings on the re-run. The key is the staged content (blob
+  // ids), so a revised change is stopped again.
+  if (isGitCommitCommand(command)) {
+    const staged = git(["diff", "--cached", "--raw", "--no-abbrev"], context.cwd);
+    if (staged) context = { ...context, pauseKey: hash([context.head, staged].join("\n")) };
+  }
   const body = await postJson(`${credentials.api}/developer-sessions/${encodeURIComponent(context.sessionExternalId)}/commit-check`, credentials.token, {
     sessionId: context.sessionExternalId,
     repo: context.repo,
@@ -732,6 +739,18 @@ async function maybeRunCommitCheck(input, credentials, context) {
     diffSummary,
   }).catch(() => null);
   return deliverNotesV2("PreToolUse", body, context, input);
+}
+
+// True when the shell command itself runs `git commit`, not when it only
+// mentions one: a PR body, a heredoc, `git commit-tree`, or a dry run.
+function isGitCommitCommand(command) {
+  const bare = String(command)
+    .replace(/<<-?[ \t]*(['"]?)([A-Za-z_][\w-]*)\1([^\n]*)(?:(?:\n[\s\S]*?)?\n[ \t]*\2[ \t]*(?=\n|$)|\n[\s\S]*$)/g, "$3")
+    .replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''");
+  return bare.split(/[;&|\n()`]/).some((segment) => {
+    const words = segment.trim().replace(/^(?:(?:!|then|do|else|time|env)\s+|[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*/, "");
+    return /^git\s+commit(?:\s|$)/.test(words) && !/\s--dry-run(?:[\s=]|$)/.test(words);
+  });
 }
 
 // Ids shown in the last week, newest 200, so the state file stays small.
@@ -1163,15 +1182,25 @@ function deliverNotesV2(point, response, context, input = {}, fromCache = false)
     const lines = rendered.flatMap(({ out }) => out.contextLines);
     const howTo = [...new Set(rendered.map(({ block }) => block.howTo).filter(Boolean))].join(" ");
     const message = rendered.map(({ out }) => out.message).filter(Boolean).join("\n");
-    const contextText = lines.length ? libraContext(context.repo, lines, howTo) : "";
+    // Codex rejects an "ask" decision and drops the whole hook output. There a
+    // pause stops a real commit once per staged change and says why; the agent
+    // asks the developer, and the same commit run again goes ahead. Anything
+    // else, a repeat included, reaches the agent as context.
+    let pause = point === "PreToolUse" && rendered.some(({ block }) => block.pause);
+    const codex = context.agent === "codex";
+    const codexPause = pause && codex && Boolean(context.pauseKey) && ownClaim(`codex-pause|${id}|${context.repo}|${context.pauseKey}`);
+    if (pause && codex && !codexPause) {
+      pause = false;
+      for (const note of staged) if (note.channel === "pause") note.channel = "tell";
+    }
+    const contextText = lines.length ? libraContext(context.repo, lines, codexPause ? `${howTo} ${CODEX_PAUSE_HOW_TO}`.trim() : howTo) : "";
     let output = null;
     if (spontaneous) output = contextText || null;
     else if (point === "Stop") output = contextText && !isFlagSet(input.stop_hook_active ?? input.stopHookActive) ? { decision: "block", reason: contextText } : null;
     else {
-      const pause = point === "PreToolUse" && rendered.some(({ block }) => block.pause);
       const result = {};
       if (message) result.systemMessage = message;
-      if (contextText || pause) result.hookSpecificOutput = { hookEventName: point, ...(pause ? { permissionDecision: "ask", permissionDecisionReason: contextText || message } : { additionalContext: contextText }) };
+      if (contextText || pause) result.hookSpecificOutput = { hookEventName: point, ...(pause ? { permissionDecision: codexPause ? "deny" : "ask", permissionDecisionReason: contextText || message } : { additionalContext: contextText }) };
       if (Object.keys(result).length) output = result;
     }
     // Nothing is consumed until the emitter has passed its final activity gate
@@ -1565,6 +1594,8 @@ function visibleBlock(header, lines) {
 function plainDashes(text) {
   return String(text).replace(/\s*[\u2014\u2013]\s+|\s+[\u2014\u2013]\s*/g, ": ").replace(/[\u2014\u2013]/g, "-");
 }
+
+const CODEX_PAUSE_HOW_TO = "Libra stopped this command once so the developer can decide. Tell them what Libra found in your own words, with its evidence limits, and ask whether to go ahead or fix it first. Run the same command again only if they say to go ahead; Libra will not stop it a second time.";
 
 function libraContext(repo, lines, howToUse) {
   const source = `Libra production monitoring for ${shortRepo(repo).replace(/["<>]/g, "")}`;
