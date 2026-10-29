@@ -12,7 +12,7 @@ const MAX_EVENTS_PER_POST = 50;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "2.0.4";
+const PLUGIN_VERSION = "2.0.5";
 const MAX_PENDING_SURFACED = 50;
 // Fast updates (see runNewestInstalledCopy): where this copy lives, how often
 // a hook may ask Claude Code to refresh the plugin, and the size cap for
@@ -155,7 +155,10 @@ async function main() {
     await runFlush();
     return;
   }
-  if (!WATCH_MODE && mode !== "feedback") refreshInstallInBackground();
+  if (!WATCH_MODE && mode !== "feedback") {
+    refreshInstallInBackground();
+    refreshCodexCloneInBackground();
+  }
   if (mode === "feedback") {
     await runFeedback(process.argv.slice(3));
     return;
@@ -178,7 +181,10 @@ async function main() {
   const credentials = readCredentials();
   if (!credentials.token) return;
 
-  const agent = normalizeAgentName(process.argv[2] || input.agent || input.client || detectAgentFromEnv());
+  const agent = resolveAgent(input);
+  // A Libra plugin inside Codex steps aside for the user-level hooks, which keep
+  // their approval across updates. Both would otherwise record every event twice.
+  if (agent === "codex" && process.argv[2] !== "codex" && codexInstallElsewhere()) return;
 
   const sessionExternalId = String(
     input.session_id ||
@@ -197,8 +203,12 @@ async function main() {
 
   // When Claude last finished a turn: held news waits for the developer to be done.
   observeDeliveryState(sessionExternalId, hookEvent, input);
+  // A command against production asks the server what Libra holds, at most
+  // once per ten minutes a session; the rest of the time it is only recorded.
+  const prodCommand = hookEvent === "PreToolUse" ? prodCommandSource(input) : null;
+  const askProd = Boolean(prodCommand) && claimRefreshSlot(`${hash(sessionExternalId)}.prod-command.lock`, PROD_COMMAND_INTERVAL_MS);
   // Hooks that cannot answer record their event locally and return at once.
-  const lane = hookLane(hookEvent, input);
+  const lane = hookLane(hookEvent, input, askProd ? prodCommand : null);
   if (lane !== "answer") {
     const output = await localHook(lane, { input, hookEvent, config, agent, cwd, sessionExternalId, visible });
     if (output) await emitDeliveryV2([output], hookEvent);
@@ -257,6 +267,7 @@ async function main() {
       metadata: sessionMetadata({ agent, hookEvent, config, transcriptPath, repoInfo }),
       events: sendEvents,
       ...(watchedPrs.length ? { watch: { prs: watchedPrs } } : {}),
+      ...(askProd ? { prodCommand } : {}),
     }).catch(() => null)
     : Promise.resolve(null);
   const isBashPreTool = hookEvent === "PreToolUse" && String(input.tool_name || input.tool || "").toLowerCase() === "bash";
@@ -283,12 +294,13 @@ async function main() {
 
 // "answer": the hook's output depends on the server, so it waits for it.
 // Everything else is answered from local state, or not at all.
-function hookLane(hookEvent, input) {
+function hookLane(hookEvent, input, prodCommand = null) {
   if (hookEvent === "SessionStart" || hookEvent === "UserPromptSubmit" || hookEvent === "Stop") return "answer";
   if (hookEvent === "PreToolUse") {
     const tool = String(input.tool_name || input.tool || "").toLowerCase();
     const command = String(input.tool_input?.command ?? input.toolInput?.command ?? "");
     if (tool === "bash" && /\bgit\s+commit\b/.test(command)) return "answer";
+    if (prodCommand) return "answer";
     return "record";
   }
   if (hookEvent === "SubagentStart") return "subagent";
@@ -296,6 +308,79 @@ function hookLane(hookEvent, input) {
   // The manual heartbeat in /libra-login and unknown events keep the old path.
   if (hookEvent === "event") return "answer";
   return "record";
+}
+
+// A Bash command that reaches production. The developer is chasing something
+// there by hand, often something Libra already holds, so the agent gets what
+// Libra knows before the command runs. Mirrors the server's session-learning
+// classifier (session-learning/sources.ts segmentSource), with the hosts other
+// stacks use. Only the program a segment starts with counts: a word in a path
+// or a script being edited is not a production read.
+const PROD_COMMAND_INTERVAL_MS = 10 * 60 * 1000;
+function prodCommandSegments(command) {
+  const out = [];
+  let current = "";
+  let quote = null;
+  const push = () => { if (current.trim()) out.push(current.trim()); current = ""; };
+  for (let i = 0; i < command.length; i += 1) {
+    const c = command[i];
+    if (quote === "'") { if (c === "'") quote = null; current += c; continue; }
+    if (c === "\\") { current += c + (command[i + 1] ?? ""); i += 1; continue; }
+    if (c === "$" && command[i + 1] === "(") { push(); i += 1; continue; }
+    if (c === "`") { push(); continue; }
+    if (quote === '"') { if (c === '"') quote = null; current += c; continue; }
+    if (c === "'" || c === '"') { quote = c; current += c; continue; }
+    if (c === "\n" || c === ";" || c === "|" || (c === "&" && command[i + 1] === "&")) {
+      push();
+      if (command[i + 1] === c) i += 1;
+      continue;
+    }
+    current += c;
+  }
+  push();
+  return out;
+}
+function prodSegmentSource(segment) {
+  let s = segment;
+  for (;;) {
+    const before = s;
+    s = s.replace(/^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)(?:\s+|$)/, "");
+    s = s.replace(/^(?:sudo(?:\s+(?:-[ugCDhpRrt]\s+\S+|-\S+))*|g?timeout(?:\s+-\S+)*\s+\S+|env(?:\s+-\S+)*|time|nohup|command|exec)\s+/, "");
+    if (s === before) break;
+  }
+  if (/^aws\s+(?:sts|configure|sso|help)\b/.test(s)) return null;
+  if (/^aws\s+(?:logs|cloudwatch)\b/.test(s)) return "cloudwatch";
+  if (/^aws\s+ecs\b/.test(s)) return "ecs";
+  if (/^aws\s+elbv2\b/.test(s)) return "alb";
+  if (/^aws\s+stepfunctions\b/.test(s)) return "stepfunctions";
+  if (/^aws\s+sqs\b/.test(s)) return "sqs";
+  if (/^aws\s+[a-z0-9-]+\s/.test(s)) return "aws";
+  if (/^(?:psql|pg_dump)\b/.test(s)) return "app_db";
+  if (/^(?:python3?|node|tsx|npx\s+tsx)\b/.test(s) && /\bpsql\b|psycopg|DATABASE_URL|new\s+(?:pg\.)?(?:Client|Pool)\b/.test(s)) return "app_db";
+  if (/^axiom\b/.test(s)) return "axiom";
+  if (/^sentry-cli\b/.test(s)) return "sentry";
+  if (/^heroku\s+(?:logs|pg:|ps\b|releases)/.test(s)) return "heroku";
+  if (/^gcloud\s+(?:logging|run|sql)\b/.test(s)) return "gcloud";
+  if (/^(?:fly|flyctl)\s+(?:logs|ssh|status)\b/.test(s)) return "fly";
+  if (/^kubectl\s+(?:logs|get|describe|top|exec)\b/.test(s)) return "kubectl";
+  if (/^curl\b/.test(s)) {
+    if (/posthog\.com/.test(s)) return "posthog";
+    if (/axiom\.co/.test(s)) return "axiom";
+    if (/sentry\.io/.test(s)) return "sentry";
+    if (/supabase\.(?:co|com)/.test(s)) return "supabase";
+  }
+  return null;
+}
+function prodCommandSource(input) {
+  const tool = String(input.tool_name || input.tool || "").toLowerCase();
+  const command = String(input.tool_input?.command ?? input.toolInput?.command ?? "").slice(0, MAX_COMMAND_SCAN);
+  // Libra never reacts to itself: /libra-feedback and the hooks run this script.
+  if (tool !== "bash" || !command || /libra-hook\.mjs/.test(command)) return null;
+  for (const segment of prodCommandSegments(command)) {
+    const source = prodSegmentSource(segment);
+    if (source) return source;
+  }
+  return null;
 }
 
 function sessionMetadata({ agent, hookEvent, config, transcriptPath, repoInfo }) {
@@ -450,6 +535,16 @@ function normalizeAgentName(value) {
   if (raw.includes("codex")) return "codex";
   if (raw.includes("claude")) return "claude-code";
   return "claude-code";
+}
+
+// Codex writes transcripts to <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl. A
+// Codex plugin runs the Claude Code hook commands unchanged, so the transcript,
+// not the command line, tells the two agents apart.
+const CODEX_ROLLOUT_RE = /[\\/]sessions[\\/]\d{4}[\\/]\d{2}[\\/]\d{2}[\\/]rollout-[^\\/]+\.jsonl$/;
+function resolveAgent(input) {
+  const named = normalizeAgentName(process.argv[2] || input.agent || input.client || detectAgentFromEnv());
+  const transcript = input.transcript_path ?? input.transcriptPath;
+  return typeof transcript === "string" && CODEX_ROLLOUT_RE.test(transcript) ? "codex" : named;
 }
 
 function detectAgentFromEnv() {
@@ -1300,25 +1395,7 @@ function refreshInstallInBackground() {
   const updatesOff = process.env.DISABLE_AUTOUPDATER || process.env.DISABLE_UPDATES || process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC;
   if (updatesOff && !process.env.FORCE_AUTOUPDATE_PLUGINS) return;
   const layout = installLayout();
-  if (!layout || !marketplaceAutoUpdates(layout)) return;
-  try {
-    const dir = stateDir();
-    fs.mkdirSync(dir, { recursive: true });
-    const lock = path.join(dir, "plugin-refresh.lock");
-    const now = Date.now();
-    try {
-      if (now - fs.statSync(lock).mtimeMs < SELF_UPDATE_INTERVAL_MS) return;
-      // Only one of several parallel hooks wins this rename.
-      const old = `${lock}.${process.pid}.old`;
-      fs.renameSync(lock, old);
-      fs.rmSync(old, { force: true });
-    } catch (error) {
-      if (error?.code !== "ENOENT") return;
-    }
-    fs.writeFileSync(lock, String(now), { flag: "wx" });
-  } catch {
-    return;
-  }
+  if (!layout || !marketplaceAutoUpdates(layout) || !claimRefreshSlot("plugin-refresh.lock")) return;
   const script = [
     "const { execFileSync } = require('node:child_process');",
     `const opts = { stdio: 'ignore', timeout: ${SELF_UPDATE_COMMAND_MS} };`,
@@ -1330,6 +1407,81 @@ function refreshInstallInBackground() {
       stdio: "ignore",
       env: { ...process.env, LIBRA_HOOK_DELEGATED: "", LIBRA_HOOK_INSTALL_ROOT: "" },
     });
+    child.on("error", () => {});
+    child.unref();
+  } catch {}
+}
+
+// True for at most one hook per lock every 15 minutes, across all sessions on the machine.
+function claimRefreshSlot(name, intervalMs = SELF_UPDATE_INTERVAL_MS) {
+  try {
+    const dir = stateDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const lock = path.join(dir, name);
+    const now = Date.now();
+    try {
+      if (now - fs.statSync(lock).mtimeMs < intervalMs) return false;
+      // Only one of several parallel hooks wins this rename.
+      const old = `${lock}.${process.pid}.old`;
+      fs.renameSync(lock, old);
+      fs.rmSync(old, { force: true });
+    } catch (error) {
+      if (error?.code !== "ENOENT") return false;
+    }
+    fs.writeFileSync(lock, String(now), { flag: "wx" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The Codex install (install-codex-hooks.mjs) records the plugin clone its hooks
+// run from. Codex keeps a user-level hook approved while its command is unchanged,
+// so that clone updates itself in place rather than moving to a new version folder.
+function codexInstallRecord() {
+  try {
+    const record = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".config/libra/codex-install.json"), "utf8"));
+    return typeof record?.root === "string" ? record : null;
+  } catch {
+    return null;
+  }
+}
+
+function isPluginRoot(root) {
+  try {
+    return fs.realpathSync(root) === fs.realpathSync(PLUGIN_ROOT);
+  } catch {
+    return false;
+  }
+}
+
+function codexInstallElsewhere() {
+  const record = codexInstallRecord();
+  return Boolean(record) && fs.existsSync(path.join(record.root, "scripts", "libra-hook.mjs")) && !isPluginRoot(record.root);
+}
+
+// A newer main is merged only when it fast-forwards and its hook script parses.
+function refreshCodexCloneInBackground() {
+  if (process.env.LIBRA_PLUGIN_SELF_UPDATE === "0") return;
+  const record = codexInstallRecord();
+  if (!record || record.selfUpdate === false || !isPluginRoot(record.root) || !fs.existsSync(path.join(PLUGIN_ROOT, ".git"))) return;
+  if (!claimRefreshSlot("codex-clone-refresh.lock")) return;
+  const script = [
+    "const { execFileSync } = require('node:child_process'); const fs = require('node:fs'); const os = require('node:os'); const path = require('node:path');",
+    `const opts = { cwd: process.argv[1], stdio: ['ignore', 'pipe', 'ignore'], timeout: ${SELF_UPDATE_COMMAND_MS}, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } };`,
+    "const git = (...args) => execFileSync('git', args, opts).toString().trim();",
+    "try {",
+    "  git('fetch', '--quiet', 'origin', 'main');",
+    "  if (git('rev-parse', 'HEAD') !== git('rev-parse', 'FETCH_HEAD')) {",
+    "    const check = path.join(os.tmpdir(), `libra-hook-check-${process.pid}.mjs`);",
+    "    fs.writeFileSync(check, execFileSync('git', ['show', 'FETCH_HEAD:scripts/libra-hook.mjs'], { ...opts, maxBuffer: 16 * 1024 * 1024 }));",
+    "    try { execFileSync(process.execPath, ['--check', check], { stdio: 'ignore', timeout: 10000 }); } finally { fs.rmSync(check, { force: true }); }",
+    "    git('merge', '--ff-only', '--quiet', 'FETCH_HEAD');",
+    "  }",
+    "} catch {}",
+  ].join("\n");
+  try {
+    const child = spawn(process.execPath, ["-e", script, PLUGIN_ROOT], { detached: true, stdio: "ignore" });
     child.on("error", () => {});
     child.unref();
   } catch {}
@@ -1414,8 +1566,10 @@ function shortRepo(repo) {
 // remembered well past that.
 const SHOWN_RISK_MEMORY_MS = 7 * 24 * 60 * 60 * 1000;
 
-// Notes that never reach the developer's conversation, even through their agent.
-const AGENT_ONLY_KINDS = new Set(["subagent_context", "investigation_started"]);
+// Notes that never reach the developer's conversation, even through their agent,
+// or are background the agent may draw on (production-command context). Neither
+// becomes the note /libra-feedback rates.
+const AGENT_ONLY_KINDS = new Set(["subagent_context", "investigation_started", "prod_command"]);
 
 // Everything Libra shows is recorded, so usefulness can be measured against
 // what the developer actually saw. Queued locally, one file per event, and sent

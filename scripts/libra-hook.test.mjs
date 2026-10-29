@@ -12,7 +12,7 @@ const HOOK = path.join(ROOT, "scripts", "libra-hook.mjs");
 // The server writes every note the plugin shows. Fixtures stay in the server's
 // input shape (risk rows, review queue, prompt matches), and the harness turns
 // them into notes with the real server code, so these tests run the whole path.
-const { promptMatchNotes } = await import(path.join(ROOT, "..", "api", "src", "services", "coding-agent-notes.ts"));
+const { promptMatchNotes, prodCommandNotes } = await import(path.join(ROOT, "..", "api", "src", "services", "coding-agent-notes.ts"));
 
 const { productionNotesV2, v2Block, commitCheckNotes } = await import(path.join(ROOT, "..", "api", "src", "services", "coding-agent-notes-v2.ts"));
 const { parsePluginReport, notePolicy } = await import(path.join(ROOT, "..", "api", "src", "services", "coding-agent-delivery.ts"));
@@ -862,7 +862,7 @@ test("Parallel gh commands in one session lose no watched PR", async () => {
   });
 });
 
-test("The Stop hook is registered, and the Codex installer is unchanged", () => {
+test("The Stop hook and the review watcher stay registered for Claude Code", () => {
   const hooks = JSON.parse(fs.readFileSync(path.join(ROOT, "hooks", "hooks.json"), "utf8")).hooks;
   assert.deepEqual(hooks.Stop, [{ hooks: [
     { type: "command", command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/libra-hook.mjs" claude-code', "timeout": 10 },
@@ -1064,6 +1064,134 @@ test("With auto-update on, hooks refresh the plugin in the background at most ev
 });
 
 // ---------------------------------------------------------------------------
+// Codex: user-level hooks run from one fixed clone that updates itself, and a
+// Libra plugin inside Codex steps aside for them.
+
+const codexRollout = (home, sid = "019a2f3c-0000-7000-8000-000000000001") => {
+  const file = path.join(home, ".codex", "sessions", "2026", "10", "29", `rollout-2026-10-29T10-00-00-${sid}.jsonl`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "");
+  return file;
+};
+
+function writeCodexRecord(home, root, extra = {}) {
+  fs.mkdirSync(path.join(home, ".config", "libra"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".config", "libra", "codex-install.json"), JSON.stringify({ root, hooksRev: 2, selfUpdate: true, ...extra }));
+}
+
+test("A hook Codex runs with the plugin's claude-code argument is still treated as Codex", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-codex-plugin-"));
+  await withApi({ [EVENTS]: () => v2Answer([v2BlockFixture()]) }, async (api, requests) => {
+    const input = { hook_event_name: "SessionStart", source: "startup", session_id: "codex-plugin", cwd: repo, transcript_path: codexRollout(home) };
+    const out = JSON.parse((await runHook({ api, home, cwd: repo, input })).stdout);
+    assert.equal(out.systemMessage, undefined, "Codex cannot show a line on screen");
+    assert.match(out.hookSpecificOutput.additionalContext, /3 requests returned 500/);
+    assert.equal(requests.at(-1).body.client, "codex");
+    assert.equal(requests.at(-1).body.plugin.capabilities.show, false);
+
+    // A Claude Code transcript keeps the argument's agent.
+    const claudeTranscript = path.join(home, ".claude", "projects", "app", "claude-session.jsonl");
+    fs.mkdirSync(path.dirname(claudeTranscript), { recursive: true });
+    fs.writeFileSync(claudeTranscript, "");
+    const claudeHome = fs.mkdtempSync(path.join(os.tmpdir(), "libra-codex-plugin-"));
+    await runHook({ api, home: claudeHome, cwd: repo, input: { ...input, session_id: "claude-plugin", transcript_path: claudeTranscript } });
+    assert.equal(requests.at(-1).body.client, "claude-code");
+  });
+});
+
+test("With the user-level Codex install elsewhere, the Libra plugin inside Codex steps aside", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-codex-aside-"));
+  const clone = path.join(home, ".config", "libra", "plugin");
+  fs.mkdirSync(path.join(clone, "scripts"), { recursive: true });
+  fs.copyFileSync(HOOK, path.join(clone, "scripts", "libra-hook.mjs"));
+  writeCodexRecord(home, clone);
+  await withApi({ [EVENTS]: () => v2Answer([v2BlockFixture()]) }, async (api, requests) => {
+    const input = { hook_event_name: "SessionStart", source: "startup", session_id: "codex-aside", cwd: repo, transcript_path: codexRollout(home) };
+    const plugin = await runHook({ api, home, cwd: repo, input });
+    assert.equal(plugin.code, 0);
+    assert.equal(plugin.stdout, "");
+    assert.equal(requests.length, 0, "the user-level hooks send this session");
+
+    // The same script named as the Codex hook is the user-level install and runs.
+    const codex = JSON.parse((await runHook({ api, home, cwd: repo, args: ["codex"], input })).stdout);
+    assert.match(codex.hookSpecificOutput.additionalContext, /3 requests/);
+    assert.equal(requests.at(-1).body.client, "codex");
+
+    // Claude Code sessions are unaffected.
+    await runHook({ api, home, cwd: repo, input: { ...input, session_id: "claude-session", transcript_path: undefined } });
+    assert.equal(requests.at(-1).body.client, "claude-code");
+  });
+});
+
+function gitIn(cwd, ...args) {
+  const result = spawnSync("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", ...args], { cwd, encoding: "utf8" });
+  assert.equal(result.status, 0, `git ${args.join(" ")}: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+function makeCodexClone() {
+  const remote = fs.mkdtempSync(path.join(os.tmpdir(), "libra-clone-remote-"));
+  fs.mkdirSync(path.join(remote, "scripts"));
+  fs.copyFileSync(HOOK, path.join(remote, "scripts", "libra-hook.mjs"));
+  gitIn(remote, "init", "-q", "-b", "main");
+  gitIn(remote, "add", "-A");
+  gitIn(remote, "commit", "-q", "-m", "plugin");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-clone-home-"));
+  const clone = path.join(home, ".config", "libra", "plugin");
+  fs.mkdirSync(path.dirname(clone), { recursive: true });
+  gitIn(path.dirname(clone), "clone", "-q", remote, clone);
+  writeCodexRecord(home, clone);
+  const commit = (text) => {
+    fs.appendFileSync(path.join(remote, "scripts", "libra-hook.mjs"), text);
+    gitIn(remote, "commit", "-q", "-am", "next");
+    return gitIn(remote, "rev-parse", "HEAD");
+  };
+  const head = () => gitIn(clone, "rev-parse", "HEAD");
+  const fetched = () => { try { return fs.readFileSync(path.join(clone, ".git", "FETCH_HEAD"), "utf8"); } catch { return ""; } };
+  const unlock = () => fs.rmSync(path.join(home, ".config", "libra", "coding-agent", "codex-clone-refresh.lock"), { force: true });
+  return { home, clone, hook: path.join(clone, "scripts", "libra-hook.mjs"), commit, head, fetched, unlock };
+}
+
+test("The Codex clone fast-forwards itself in the background, at most every 15 minutes, and never to a broken script", async () => {
+  const c = makeCodexClone();
+  const input = { hook_event_name: "SessionStart", session_id: "s", transcript_path: codexRollout(c.home) };
+  const next = c.commit("\n// next release\n");
+  const run = await runInstalled({ hook: c.hook, home: c.home, args: ["codex"], input });
+  assert.equal(run.code, 0);
+  assert.equal(run.stdout, "", "no credentials, so the hook says nothing while the clone updates");
+  assert.ok(await waitUntil(() => c.head() === next, 10_000), "the clone moved to the next release");
+
+  // Inside 15 minutes, a newer release waits.
+  const later = c.commit("\n// later release\n");
+  await runInstalled({ hook: c.hook, home: c.home, args: ["codex"], input });
+  await sleep(1_000);
+  assert.equal(c.head(), next, "a second hook inside 15 minutes does not refresh again");
+
+  // A release whose hook script does not parse is fetched but never merged.
+  const broken = c.commit("\nthis is not javascript (\n");
+  c.unlock();
+  await runInstalled({ hook: c.hook, home: c.home, args: ["codex"], input });
+  assert.ok(await waitUntil(() => c.fetched().includes(broken), 10_000), "the broken release was fetched");
+  await sleep(500);
+  assert.equal(c.head(), next, "the clone stays on the last script that parses");
+  assert.notEqual(c.head(), later);
+
+  // Switched off, nothing is fetched.
+  const off = makeCodexClone();
+  off.commit("\n// next release\n");
+  const before = off.head();
+  await runInstalled({ hook: off.hook, home: off.home, args: ["codex"], input, env: { LIBRA_PLUGIN_SELF_UPDATE: "0" } });
+  // A copy the installer made without git, or a hook outside the recorded clone, never updates either.
+  writeCodexRecord(off.home, off.clone, { selfUpdate: false });
+  await runInstalled({ hook: off.hook, home: off.home, args: ["codex"], input });
+  writeCodexRecord(off.home, path.join(off.home, "elsewhere"));
+  await runInstalled({ hook: off.hook, home: off.home, args: ["codex"], input });
+  await sleep(1_000);
+  assert.equal(off.head(), before);
+  assert.equal(off.fetched(), "");
+});
+
+// ---------------------------------------------------------------------------
 // Plugin 0.4.0: hooks that only record do not wait on the network, subagents
 // get production context, failures are matched against production errors, and
 // a session monitor delivers news and reviews.
@@ -1111,7 +1239,7 @@ test("A tool call records locally and returns at once; a background sender posts
     assert.equal(sent.length, 6, "every tool event reached the server");
     assert.ok(requests.length <= 3, `a burst goes out in a few batches, not one per hook: ${requests.length}`);
     assert.ok(sent.every((e) => /^[0-9a-f]{40}$/.test(e.sourceHead || "") || e.sourceHead === null), "the sender stamps the head it sees");
-    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.4");
+    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.5");
   });
 });
 
@@ -1228,7 +1356,7 @@ test("v2 sends capabilities and state, uses server prose once, and keeps Codex c
     assert.match(shown.hookSpecificOutput.additionalContext, /3 requests returned 500/);
     assert.doesNotMatch(shown.hookSpecificOutput.additionalContext, /\*\*Libra flagged/);
     assert.equal(requests[0].body.plugin.contract, 2);
-    assert.equal(requests[0].body.plugin.version, "2.0.4");
+    assert.equal(requests[0].body.plugin.version, "2.0.5");
     assert.equal(requests[0].body.plugin.state.phase, "working");
     assert.ok(requests[0].body.plugin.capabilities.hooks.includes("Stop"));
     assert.equal((await runHook({ api, home, cwd: repo, input: { ...input, session_id: "another-window" } })).stdout, "");
@@ -1563,7 +1691,7 @@ test("v2 compaction re-injects context without consuming visible once-only news"
 test("v2 old launch handoff reports original wiring and never prints from a legacy async argv", async () => {
   const current = fs.readFileSync(HOOK, "utf8");
   const install = makeInstall({ marketplaceScript: current });
-  fs.writeFileSync(install.hook, current.replace('const PLUGIN_VERSION = "2.0.4";', 'const PLUGIN_VERSION = "0.7.1";'));
+  fs.writeFileSync(install.hook, current.replace(/const PLUGIN_VERSION = "[^"]+";/, 'const PLUGIN_VERSION = "0.7.1";'));
   const launchRoot = path.dirname(path.dirname(install.hook));
   fs.mkdirSync(path.join(launchRoot, "hooks"), { recursive: true });
   fs.writeFileSync(path.join(launchRoot, "hooks", "hooks.json"), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command" }] }], PostToolUse: [{ hooks: [{ type: "command" }] }] } }));
@@ -1572,7 +1700,7 @@ test("v2 old launch handoff reports original wiring and never prints from a lega
     const env = { LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test", LIBRA_HOOK_FLUSH: "inline" };
     const shown = await runInstalled({ ...install, env, input: { hook_event_name: "SessionStart", source: "startup", session_id: "old-v2-handoff", cwd: repo } });
     assert.match(shown.stdout, /Measured request failures/);
-    assert.equal(requests[0].body.plugin.version, "2.0.4");
+    assert.equal(requests[0].body.plugin.version, "2.0.5");
     assert.equal(requests[0].body.plugin.capabilities.launchVersion, "0.7.1");
     assert.deepEqual(requests[0].body.plugin.capabilities.hooks, ["SessionStart", "PostToolUse"]);
     const background = await runInstalled({ ...install, env, args: ["claude-code", "async"], input: { hook_event_name: "PostToolUse", session_id: "old-v2-handoff", cwd: repo, tool_name: "Bash", tool_input: { command: "gh pr checks 42" } } });
@@ -1708,6 +1836,71 @@ test("v2 actual transcript turns and incomplete transcript evidence still preven
       seedWatch(home, sid); seedV2State(home, sid, { stoppedAt, turnAt: stoppedAt - 60_000, promptedAt: stoppedAt - 60_000, shippedAt: stoppedAt - 30_000, transcriptPath: transcript });
       assert.equal((await runMonitor({ api, home, cwd: repo, sid })).stdout, "", label);
       assert.equal(readHeldFixture(home, sid).items.length, 1, `${label}: IDs remain held for fresh revalidation`);
+    }
+  });
+});
+
+function prodCommandAnswer(source = "cloudwatch") {
+  const risks = { count: 1, top: [{ real: true, id: "r1", severity: "P1", environment: "prod", title: "Worker runs out of memory", lastSeenAt: new Date().toISOString(), cause: "unknown", impact: "observed" }], recent: [] };
+  return v2Answer(prodCommandNotes({ repo: "acme/app", source, risks }).map((block) => v2Block(block, V2_POLICY, "now", { to: "session" })));
+}
+
+test("A command against production asks Libra once per ten minutes and hands what it holds to the agent only", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-prod-cmd-"));
+  await withApi({ [EVENTS]: (body) => (body.prodCommand ? prodCommandAnswer(body.prodCommand) : v2Answer([])) }, async (api, requests) => {
+    const first = await runHook({ api, home, cwd: repo, input: bash("sess-prod", repo, "AWS_PROFILE=prod aws logs tail /ecs/worker --since 1h", { event: "PreToolUse" }) });
+    assert.equal(requests.length, 1, "the hook asked before the command ran");
+    assert.equal(requests[0].body.prodCommand, "cloudwatch");
+    const out = JSON.parse(first.stdout);
+    assert.equal(out.systemMessage, undefined, "nothing on the developer's screen");
+    assert.match(out.hookSpecificOutput.additionalContext, /running a command against CloudWatch logs or metrics for app/);
+    assert.match(out.hookSpecificOutput.additionalContext, /Worker runs out of memory/);
+    assert.match(out.hookSpecificOutput.additionalContext, /not the developer/);
+
+    // A second production command in the same window is only recorded.
+    const second = await runHook({ api, home, cwd: repo, input: bash("sess-prod", repo, `psql "$DATABASE_URL" -c "select 1"`, { event: "PreToolUse" }) });
+    assert.equal(second.stdout, "");
+    assert.ok(requests.slice(1).every((r) => r.body.prodCommand === undefined), "no second ask inside ten minutes");
+
+    // Another session asks for itself.
+    const other = await runHook({ api, home, cwd: repo, input: bash("sess-prod-2", repo, `psql "$DATABASE_URL" -c "select 1"`, { event: "PreToolUse" }) });
+    assert.equal(requests.at(-1).body.prodCommand, "app_db");
+    assert.match(JSON.parse(other.stdout).hookSpecificOutput.additionalContext, /the application database/);
+  });
+});
+
+test("Only commands that read production are asked about", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-prod-cmd-kinds-"));
+  const cases = [
+    ["aws logs filter-log-events --log-group-name /ecs/api", "cloudwatch"],
+    ["aws cloudwatch get-metric-statistics --namespace AWS/ECS", "cloudwatch"],
+    ["sudo -E aws ecs describe-services --cluster prod", "ecs"],
+    ["sudo -u deploy timeout 30 aws sqs list-queues", "sqs"],
+    ["aws elbv2 describe-target-health --target-group-arn x", "alb"],
+    ["aws stepfunctions list-executions --state-machine-arn x", "stepfunctions"],
+    ["aws sqs get-queue-attributes --queue-url x", "sqs"],
+    ["aws rds describe-db-instances", "aws"],
+    [`psql "$DATABASE_URL" -c "select count(*) from jobs"`, "app_db"],
+    [`node -e "const { Client } = require('pg'); new Client(process.env.DATABASE_URL)"`, "app_db"],
+    ["heroku logs --tail -a api", "heroku"],
+    ["gcloud logging read 'severity>=ERROR' --limit 50", "gcloud"],
+    ["fly logs -a api", "fly"],
+    ["kubectl logs deploy/api --since=1h", "kubectl"],
+    ["curl -s https://us.posthog.com/api/projects/1/query -H 'Authorization: Bearer x'", "posthog"],
+    ["cd api && npm test", null],
+    ["git log --oneline | head", null],
+    ["gh pr view 12", null],
+    ["aws sts get-caller-identity", null],
+    ["aws configure list", null],
+    ["echo psql is not run here", null],
+    ["fly deploy -a api", null],
+    [`node ${HOOK} feedback good`, null],
+  ];
+  await withApi({ [EVENTS]: () => v2Answer([]) }, async (api, requests) => {
+    await Promise.all(cases.map(([command], i) => runHook({ api, home, cwd: repo, input: bash(`sess-kind-${i}`, repo, command, { event: "PreToolUse" }) })));
+    for (const [i, [command, source]] of cases.entries()) {
+      const asked = requests.filter((r) => r.body.sessionId === `sess-kind-${i}` || r.body.events?.some((e) => e.sessionId === `sess-kind-${i}`)).map((r) => r.body.prodCommand).find(Boolean) ?? null;
+      assert.equal(asked, source, command);
     }
   });
 });

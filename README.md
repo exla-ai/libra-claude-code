@@ -39,8 +39,9 @@ This is the normal install path. It installs:
 - the remote MCP server at `https://api.libra.exla.ai/mcp`.
 
 `/libra-login` stores the API key locally and adds or updates the MCP server with
-the same key. It also installs Libra hooks into `~/.codex/hooks.json` so native
-Codex sessions send the same sanitized event stream. After this, Claude Code can call `libra_query`,
+the same key. It also installs Libra's hooks for Codex (see
+[Codex](#205-codex-gets-the-full-hook-set)), so native Codex sessions send the same
+sanitized event stream and get the same context. After this, Claude Code can call `libra_query`,
 `libra_check_commit`, `libra_create_monitor`, `libra_list_sessions`, `libra_list_fix_offers`,
 `libra_view_session_events`, and `libra_accept_fix_offer`, and
 the local hook process can run commit checks when Claude Code attempts
@@ -49,9 +50,8 @@ the local hook process can run commit checks when Claude Code attempts
 After login, the Libra dashboard shows received sessions at
 `https://libra.exla.ai/dashboard/claude`. A full plugin install records a
 sanitized event on every Claude Code `SessionStart`, user prompt, tool use,
-compaction, and session end. It also records native Codex `SessionStart`,
-`UserPromptSubmit`, and `Stop` events once `/libra-login` installs the Codex
-hooks. If only MCP is installed, the coding agent can call Libra tools, but no
+compaction, and session end. Codex sessions are recorded the same way once the
+Codex hooks are installed and approved in Codex's `/hooks`. If only MCP is installed, the coding agent can call Libra tools, but no
 automatic session events are sent.
 
 ## 2.0.1 delivery fixes
@@ -96,6 +96,43 @@ lead, because you asked Libra directly.
 2.0.4 also fixes `/libra-feedback` saying there was nothing to send when its input
 arrived a moment late: its stdin was non-blocking, and a read before the input
 arrived returned nothing. Every hook now waits up to three seconds for its input.
+
+## 2.0.5 Codex gets the full hook set
+
+Codex used to run three Libra hooks, and only when Codex had already approved
+them. Codex approves a hook by its exact command and position, and its plugin
+hooks lose that approval on every plugin update, so most Codex sessions sent
+nothing. From 2.0.5:
+
+- `/libra-login` (or `node install-codex-hooks.mjs` from this plugin) clones the
+  plugin to `~/.config/libra/plugin` and adds one user-level hook per event Codex
+  runs to `~/.codex/hooks.json`: `SessionStart`, `UserPromptSubmit`,
+  `PreToolUse` (Bash), `PostToolUse`, `PostCompact`, `SubagentStart`, `Stop`, and
+  `SessionEnd`. Your other hooks keep their place, and the file you had is kept as
+  `hooks.json.before-libra`.
+- Approve them once: open Codex, run `/hooks`, and approve the Libra hooks.
+  Codex skips a hook until it is approved.
+- The hooks update that clone themselves, at most every 15 minutes, and only to a
+  release whose hook script parses. The commands never change, so the approval
+  holds. `LIBRA_PLUGIN_SELF_UPDATE=0` turns this off.
+- If the Libra plugin is also enabled inside Codex, its hooks step aside for the
+  user-level ones. Turning it off in Codex's `/plugins` avoids the approval prompt
+  it raises after each update.
+- A Libra hook inside Codex is treated as Codex even when it was started with the
+  Claude Code argument, so Codex never gets output meant for Claude Code's screen.
+
+Check the install with `node ~/.config/libra/plugin/scripts/install-codex-hooks.mjs --status`,
+which lists each Libra hook Codex found and whether it is approved. Remove it with
+`--uninstall`. Codex still gets Libra's notes as context only: it shows nothing on
+screen, and it has no session monitor or review watcher.
+
+2.0.5 also gives the agent what Libra holds when it reads production itself.
+Before a Bash command that reads production logs, metrics, queues, or the app
+database (for example `aws logs`, `psql`, `kubectl logs`, or a PostHog API
+call), the hook asks Libra once and hands the agent the open production risks
+that share terms with the command, then the top of the list. It asks at most
+once per session every 10 minutes and shows nothing on screen; the agent decides
+whether any of it bears on the work.
 
 ## Updating
 
@@ -569,7 +606,7 @@ Implemented in this package:
 - Hosted remote MCP endpoint at `https://api.libra.exla.ai/mcp` for on-demand tools.
 - Claude Code hooks for session start, user prompts, tool use, compaction, stop, session end,
   and commit attempts.
-- Codex hook installer for native Codex session start, user prompt, and stop events.
+- Codex hooks (plugin 2.0.5): every event Codex runs, from a self-updating clone that Codex approves once.
 - Local redaction, transcript tailing by offset, bounded event batches, and fail-open API
   calls.
 - Commit checks, sanitized session-event viewing, fix-offer listing, and
