@@ -12,7 +12,7 @@ const MAX_EVENTS_PER_POST = 50;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "2.0.7";
+const PLUGIN_VERSION = "2.0.8";
 const MAX_PENDING_SURFACED = 50;
 // Fast updates (see runNewestInstalledCopy): where this copy lives, how often
 // a hook may ask Claude Code to refresh the plugin, and the size cap for
@@ -654,35 +654,65 @@ function sanitizeToolInput(toolInput, config) {
 }
 
 function tailTranscriptSummaries(transcriptPath, sessionExternalId, config, agent) {
-  const lines = tailNewTranscriptLines(transcriptPath, sessionExternalId, config);
-  return lines.map((line, index) => {
-    const parsed = safeJson(line);
+  return transcriptEntries(tailNewTranscriptLines(transcriptPath, sessionExternalId, config)).map((entry, index) => {
+    const summary = summarizeTranscriptLine(entry);
     return {
       type: "transcript_summary",
       occurredAt: new Date().toISOString(),
       sequence: sequenceAt(Date.now(), BATCH_LANE + index + 1),
-      summary: summarizeTranscriptLine(parsed || line),
+      summary,
       payload: sanitizeValue({
         agent,
-        kind: parsed?.type || parsed?.role || "transcript_line",
-        summary: summarizeTranscriptLine(parsed || line),
+        kind: typeof entry === "string" ? "transcript_line" : entry.type || entry.role || "transcript_line",
+        summary,
       }),
     };
   });
 }
 
 function tailTranscriptEvents(transcriptPath, sessionExternalId, config, agent) {
-  const lines = tailNewTranscriptLines(transcriptPath, sessionExternalId, config);
-  return lines.map((line, index) => {
+  return transcriptEntries(tailNewTranscriptLines(transcriptPath, sessionExternalId, config)).map((entry, index) => ({
+    type: "transcript_event",
+    occurredAt: new Date().toISOString(),
+    sequence: sequenceAt(Date.now(), BATCH_LANE + index + 1),
+    summary: summarizeTranscriptLine(entry),
+    payload: sanitizeValue({ agent, entry: typeof entry === "string" ? { line: entry } : entry }),
+  }));
+}
+
+// The newest transcript entries, with Codex rollout lines rewritten in the
+// Claude Code shape the server reads (`user: ...`, `assistant: [...]`).
+function transcriptEntries(lines) {
+  const entries = [];
+  for (const line of lines) {
     const parsed = safeJson(line);
-    return {
-      type: "transcript_event",
-      occurredAt: new Date().toISOString(),
-      sequence: sequenceAt(Date.now(), BATCH_LANE + index + 1),
-      summary: summarizeTranscriptLine(parsed || line),
-      payload: sanitizeValue({ agent, entry: parsed || { line } }),
-    };
-  });
+    const entry = isCodexRolloutLine(parsed) ? codexTranscriptEntry(parsed.payload) : parsed || line;
+    if (entry) entries.push(entry);
+  }
+  return entries.slice(-MAX_EVENTS_PER_POST);
+}
+
+// A Codex rollout line keeps its content under `payload`; Claude Code lines
+// never carry one.
+function isCodexRolloutLine(value) {
+  return Boolean(value && typeof value === "object" && typeof value.type === "string"
+    && value.payload && typeof value.payload === "object" && !value.message);
+}
+
+// Only what the developer typed and what Codex answered. Instructions, Libra's
+// own context, injected environment blocks, tool calls (the tool hooks record
+// those), reasoning and bookkeeping are dropped.
+function codexTranscriptEntry(payload) {
+  if (payload.type !== "message" || !Array.isArray(payload.content)) return null;
+  const text = payload.content
+    .filter((part) => part && (part.type === "input_text" || part.type === "output_text") && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+  if (!text) return null;
+  if (payload.role === "assistant") return { type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } };
+  if (payload.role === "user" && !/^(<|# AGENTS\.md instructions)/.test(text)) return { type: "user", message: { role: "user", content: text } };
+  return null;
 }
 
 function tailNewTranscriptLines(transcriptPath, sessionExternalId, config) {
@@ -698,9 +728,20 @@ function tailNewTranscriptLines(transcriptPath, sessionExternalId, config) {
     const buffer = Buffer.alloc(Math.max(0, length));
     fs.readSync(fd, buffer, 0, length, start);
     fs.closeSync(fd);
-    state.offsets = { ...(state.offsets || {}), [key]: stat.size };
+    // Skipping unread bytes lands mid-line (a Codex rollout's first line alone
+    // can pass the byte cap), so start at the next whole line. A last line the
+    // agent is still writing is left for the next hook.
+    let from = 0;
+    if (start > previousOffset) {
+      const newline = buffer.indexOf(0x0a);
+      from = newline < 0 ? buffer.length : newline + 1;
+    }
+    let to = buffer.length;
+    const lastNewline = buffer.lastIndexOf(0x0a);
+    if (lastNewline + 1 < to && lastNewline + 1 >= from && safeJson(buffer.subarray(lastNewline + 1).toString("utf8").trim()) === null) to = lastNewline + 1;
+    state.offsets = { ...(state.offsets || {}), [key]: start + to };
     writeState(sessionExternalId, state);
-    return buffer.toString("utf8").split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(-MAX_EVENTS_PER_POST);
+    return buffer.subarray(from, to).toString("utf8").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   } catch {
     return [];
   }

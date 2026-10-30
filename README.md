@@ -163,6 +163,22 @@ whether any of it bears on the work.
   stopped; a PR body or note that mentions one gets the finding as context.
 - Claude Code is unchanged: it still asks you to approve or deny.
 
+## 2.0.8 Codex conversations reach Libra
+
+- On Codex, every transcript summary used to arrive blank. Codex writes its
+  rollout file in a different shape from Claude Code, and the hook only read
+  Claude Code's, so Libra received `response_item: ""` for every line and never
+  saw what you asked or what Codex answered. The hook now reads Codex rollouts
+  and sends the same two things it sends for Claude Code: what you typed and
+  what the agent replied.
+- From a Codex rollout, nothing else is sent: not the base or developer
+  instructions, Libra's own context, the injected environment block, reasoning,
+  or tool output. Commands still arrive through the tool hooks as before.
+- A Codex rollout's first line can be larger than the per-hook byte cap. The
+  hook used to send that cut fragment as one line of instructions text. It now
+  starts at the next whole line, and a line the agent is still writing waits
+  for the next hook.
+
 ## Updating
 
 Third-party marketplaces do not auto-update by default. Turn it on once in
@@ -583,7 +599,8 @@ Only what Libra needs to reason, never raw secrets or full file contents:
 - the staged file names and a diffstat summary,
 - the repo, branch, and HEAD,
 - sanitized hook metadata, user-prompt summaries, tool names, and command summaries,
-- bounded sanitized transcript summaries when the agent hook exposes a transcript path,
+- bounded sanitized transcript summaries when the agent hook exposes a transcript path (on Codex,
+  only what you typed and what Codex replied),
 - bounded sanitized transcript entries only if full transcript capture is explicitly enabled,
 - the numbers of the PRs your session works on (`watch.prs`), so Libra can bring its review back,
 - the error text of a failed tool call (capped at 4,000 characters), and the type of a subagent that starts,

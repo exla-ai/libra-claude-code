@@ -1099,6 +1099,60 @@ test("A hook Codex runs with the plugin's claude-code argument is still treated 
   });
 });
 
+test("Codex rollout transcripts send what the developer typed and what Codex answered", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-codex-transcript-"));
+  const rollout = codexRollout(home);
+  const at = "2026-10-29T10:00:00.000Z";
+  const line = (type, payload) => JSON.stringify({ timestamp: at, type, payload });
+  const message = (role, text) => line("response_item", { type: "message", role, content: [{ type: role === "assistant" ? "output_text" : "input_text", text }] });
+  fs.writeFileSync(rollout, [
+    // Base instructions alone pass the per-hook byte cap, so the first read starts mid-line.
+    line("session_meta", { id: "codex-transcript", cwd: repo, cli_version: "0.165.0", base_instructions: { text: "base instructions ".repeat(6000) } }),
+    message("developer", "<permissions instructions>sandbox</permissions instructions>"),
+    message("developer", '<libra source="session_start">Libra has 2 open production risks</libra>'),
+    message("user", "# AGENTS.md instructions for the repo\n\nRead CONSTITUTION.md first."),
+    message("user", "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"),
+    line("event_msg", { type: "task_started", turn_id: "t1" }),
+    message("user", "commit the staged change"),
+    line("response_item", { type: "reasoning", summary: [{ type: "summary_text", text: "thinking about it" }] }),
+    line("response_item", { type: "custom_tool_call", name: "exec", call_id: "c1", input: "tools.exec_command({cmd: 'git commit -m x'})" }),
+    line("response_item", { type: "custom_tool_call_output", call_id: "c1", output: "[main abc123] x" }),
+    line("event_msg", { type: "token_count", info: { total_token_usage: { input_tokens: 10 } } }),
+    message("assistant", "done-3"),
+    line("event_msg", { type: "task_complete", last_agent_message: "done-3" }),
+  ].join("\n") + "\n");
+
+  await withApi({ [EVENTS]: () => ({ ok: true }) }, async (api, requests) => {
+    const input = { hook_event_name: "UserPromptSubmit", session_id: "codex-transcript", cwd: repo, transcript_path: rollout, prompt: "commit the staged change" };
+    assert.equal((await runHook({ api, home, cwd: repo, input, args: ["codex"] })).code, 0);
+    const body = requests.at(-1).body;
+    assert.equal(body.client, "codex");
+    const summaries = body.events.filter((event) => event.type === "transcript_summary");
+    assert.deepEqual(summaries.map((event) => event.summary), [
+      "user: commit the staged change",
+      'assistant: [{"type":"text","text":"done-3"}]',
+    ]);
+    assert.deepEqual(summaries.map((event) => event.payload.kind), ["user", "assistant"]);
+    const sent = JSON.stringify(summaries);
+    for (const hidden of ["base instructions", "open production risks", "sandbox", "AGENTS.md", "environment_context", "thinking about it", "abc123", "response_item", "event_msg"]) {
+      assert.ok(!sent.includes(hidden), `transcript summaries must not carry ${hidden}`);
+    }
+
+    // The next hook sends only what Codex wrote since, and leaves a line Codex
+    // is still writing for the hook after it.
+    const stop = { hook_event_name: "Stop", session_id: "codex-transcript", cwd: repo, transcript_path: rollout };
+    const answer = message("assistant", "pushed");
+    fs.appendFileSync(rollout, message("user", "and push it") + "\n" + answer.slice(0, 40));
+    await runHook({ api, home, cwd: repo, input: stop, args: ["codex"] });
+    const next = requests.at(-1).body.events.filter((event) => event.type === "transcript_summary");
+    assert.deepEqual(next.map((event) => event.summary), ["user: and push it"]);
+    fs.appendFileSync(rollout, answer.slice(40) + "\n");
+    await runHook({ api, home, cwd: repo, input: stop, args: ["codex"] });
+    const last = requests.at(-1).body.events.filter((event) => event.type === "transcript_summary");
+    assert.deepEqual(last.map((event) => event.summary), ['assistant: [{"type":"text","text":"pushed"}]']);
+  });
+});
+
 test("With the user-level Codex install elsewhere, the Libra plugin inside Codex steps aside", async () => {
   const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-codex-aside-"));
   const clone = path.join(home, ".config", "libra", "plugin");
@@ -1239,7 +1293,7 @@ test("A tool call records locally and returns at once; a background sender posts
     assert.equal(sent.length, 6, "every tool event reached the server");
     assert.ok(requests.length <= 3, `a burst goes out in a few batches, not one per hook: ${requests.length}`);
     assert.ok(sent.every((e) => /^[0-9a-f]{40}$/.test(e.sourceHead || "") || e.sourceHead === null), "the sender stamps the head it sees");
-    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.7");
+    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.8");
   });
 });
 
@@ -1356,7 +1410,7 @@ test("v2 sends capabilities and state, uses server prose once, and keeps Codex c
     assert.match(shown.hookSpecificOutput.additionalContext, /3 requests returned 500/);
     assert.doesNotMatch(shown.hookSpecificOutput.additionalContext, /\*\*Libra flagged/);
     assert.equal(requests[0].body.plugin.contract, 2);
-    assert.equal(requests[0].body.plugin.version, "2.0.7");
+    assert.equal(requests[0].body.plugin.version, "2.0.8");
     assert.equal(requests[0].body.plugin.state.phase, "working");
     assert.ok(requests[0].body.plugin.capabilities.hooks.includes("Stop"));
     assert.equal((await runHook({ api, home, cwd: repo, input: { ...input, session_id: "another-window" } })).stdout, "");
@@ -1802,7 +1856,7 @@ test("v2 old launch handoff reports original wiring and never prints from a lega
     const env = { LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test", LIBRA_HOOK_FLUSH: "inline" };
     const shown = await runInstalled({ ...install, env, input: { hook_event_name: "SessionStart", source: "startup", session_id: "old-v2-handoff", cwd: repo } });
     assert.match(shown.stdout, /Measured request failures/);
-    assert.equal(requests[0].body.plugin.version, "2.0.7");
+    assert.equal(requests[0].body.plugin.version, "2.0.8");
     assert.equal(requests[0].body.plugin.capabilities.launchVersion, "0.7.1");
     assert.deepEqual(requests[0].body.plugin.capabilities.hooks, ["SessionStart", "PostToolUse"]);
     const background = await runInstalled({ ...install, env, args: ["claude-code", "async"], input: { hook_event_name: "PostToolUse", session_id: "old-v2-handoff", cwd: repo, tool_name: "Bash", tool_input: { command: "gh pr checks 42" } } });
