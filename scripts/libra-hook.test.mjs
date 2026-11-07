@@ -1293,7 +1293,7 @@ test("A tool call records locally and returns at once; a background sender posts
     assert.equal(sent.length, 6, "every tool event reached the server");
     assert.ok(requests.length <= 3, `a burst goes out in a few batches, not one per hook: ${requests.length}`);
     assert.ok(sent.every((e) => /^[0-9a-f]{40}$/.test(e.sourceHead || "") || e.sourceHead === null), "the sender stamps the head it sees");
-    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.8");
+    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.9");
   });
 });
 
@@ -1410,7 +1410,7 @@ test("v2 sends capabilities and state, uses server prose once, and keeps Codex c
     assert.match(shown.hookSpecificOutput.additionalContext, /3 requests returned 500/);
     assert.doesNotMatch(shown.hookSpecificOutput.additionalContext, /\*\*Libra flagged/);
     assert.equal(requests[0].body.plugin.contract, 2);
-    assert.equal(requests[0].body.plugin.version, "2.0.8");
+    assert.equal(requests[0].body.plugin.version, "2.0.9");
     assert.equal(requests[0].body.plugin.state.phase, "working");
     assert.ok(requests[0].body.plugin.capabilities.hooks.includes("Stop"));
     assert.equal((await runHook({ api, home, cwd: repo, input: { ...input, session_id: "another-window" } })).stdout, "");
@@ -1856,7 +1856,7 @@ test("v2 old launch handoff reports original wiring and never prints from a lega
     const env = { LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test", LIBRA_HOOK_FLUSH: "inline" };
     const shown = await runInstalled({ ...install, env, input: { hook_event_name: "SessionStart", source: "startup", session_id: "old-v2-handoff", cwd: repo } });
     assert.match(shown.stdout, /Measured request failures/);
-    assert.equal(requests[0].body.plugin.version, "2.0.8");
+    assert.equal(requests[0].body.plugin.version, "2.0.9");
     assert.equal(requests[0].body.plugin.capabilities.launchVersion, "0.7.1");
     assert.deepEqual(requests[0].body.plugin.capabilities.hooks, ["SessionStart", "PostToolUse"]);
     const background = await runInstalled({ ...install, env, args: ["claude-code", "async"], input: { hook_event_name: "PostToolUse", session_id: "old-v2-handoff", cwd: repo, tool_name: "Bash", tool_input: { command: "gh pr checks 42" } } });
@@ -1876,6 +1876,49 @@ test("v2 watcher receives an investigation without any watched PR", async () => 
     assert.match(out.stderr, /INVESTIGATION-WAKE-RESULT/);
     assert.deepEqual(requests[0].body.watch, { prs: [], investigations: [id] });
     assert.ok(requests[0].body.plugin.capabilities.hooks.includes("Stop:rewake"));
+  });
+});
+
+test("Codex asks for a pending investigation on a tool hook, at most every 30 seconds, and stops once it is done", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-")), sid = "codex-inv-poll";
+  const id = "inv_abcdef0123456789abcd";
+  seedV2State(home, sid);
+  const dir = path.join(path.dirname(v2StateFile(home, sid)), `${sessionHash(sid)}.investigations`);
+  fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ id, seenAt: Date.now() }));
+  let status = "running";
+  const answer = () => status === "done"
+    ? v2Answer([v2BlockFixture({ key: "investigations", id: `investigation:${id}`, line: "", context: ["CODEX-INVESTIGATION-ANSWER"], delivery: { when: "now", to: "session", wake: true, ttlMs: 86_400_000, interrupt: true } })], { investigations: [{ id, status: "done" }] })
+    : v2Answer([], { evaluated: ["investigations"], investigations: [{ id, status: "running" }] });
+  const tool = { hook_event_name: "PostToolUse", session_id: sid, cwd: repo, tool_name: "Read" };
+  await withApi({ [EVENTS]: () => answer() }, async (api, requests) => {
+    const first = await runHook({ api, home, cwd: repo, args: ["codex"], input: tool });
+    assert.equal(first.stdout, "", "nothing to tell while it runs");
+    assert.deepEqual(requests.at(-1).body.plugin.state.watching.investigations, [id]);
+    assert.ok(fs.existsSync(path.join(dir, `${id}.json`)), "a running investigation stays watched");
+
+    status = "done";
+    const throttled = await runHook({ api, home, cwd: repo, args: ["codex"], input: tool });
+    assert.equal(throttled.stdout, "", "a second tool hook inside 30 seconds is only recorded");
+
+    fs.rmSync(path.join(path.dirname(v2StateFile(home, sid)), `${sessionHash(sid)}.investigation-poll.lock`), { force: true });
+    const delivered = await runHook({ api, home, cwd: repo, args: ["codex"], input: tool });
+    const output = JSON.parse(delivered.stdout);
+    assert.equal(output.hookSpecificOutput.hookEventName, "PostToolUse");
+    assert.match(output.hookSpecificOutput.additionalContext, /CODEX-INVESTIGATION-ANSWER/);
+    assert.equal(output.systemMessage, undefined, "Codex gets context, never a visible line");
+    assert.ok(!fs.existsSync(path.join(dir, `${id}.json`)), "a finished investigation is no longer asked for");
+  });
+});
+
+test("Claude Code tool hooks still never wait on the network for an investigation", async () => {
+  const repo = makeRepo(), home = fs.mkdtempSync(path.join(os.tmpdir(), "libra-v2-home-")), sid = "claude-inv-poll";
+  const id = "inv_bbbbbb0123456789abcd";
+  seedV2State(home, sid);
+  const dir = path.join(path.dirname(v2StateFile(home, sid)), `${sessionHash(sid)}.investigations`);
+  fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ id, seenAt: Date.now() }));
+  await withApi({ [EVENTS]: () => v2Answer([v2BlockFixture({ key: "investigations", id: `investigation:${id}`, line: "", context: ["CLAUDE-SHOULD-NOT-SEE-HERE"], delivery: { when: "now", to: "session", wake: true, ttlMs: 86_400_000, interrupt: true } })], { investigations: [{ id, status: "done" }] }) }, async (api) => {
+    const out = await runHook({ api, home, cwd: repo, input: { hook_event_name: "PostToolUse", session_id: sid, cwd: repo, tool_name: "Read" } });
+    assert.equal(out.stdout, "", "the monitor delivers it in Claude Code");
   });
 });
 

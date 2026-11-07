@@ -12,7 +12,7 @@ const MAX_EVENTS_PER_POST = 50;
 const SECRET_KEY_RE = /(?:token|secret|password|passwd|authorization|cookie|api[_-]?key|private[_-]?key|access[_-]?key|session|credential)/i;
 const DEFAULT_TRANSCRIPT_CAPTURE = "summary";
 // Sent with every event batch so the server can tell which installs updated.
-const PLUGIN_VERSION = "2.0.8";
+const PLUGIN_VERSION = "2.0.9";
 const MAX_PENDING_SURFACED = 50;
 // Fast updates (see runNewestInstalledCopy): where this copy lives, how often
 // a hook may ask Claude Code to refresh the plugin, and the size cap for
@@ -207,8 +207,15 @@ async function main() {
   // once per ten minutes a session; the rest of the time it is only recorded.
   const prodCommand = hookEvent === "PreToolUse" ? prodCommandSource(input) : null;
   const askProd = Boolean(prodCommand) && claimRefreshSlot(`${hash(sessionExternalId)}.prod-command.lock`, PROD_COMMAND_INTERVAL_MS);
+  // Codex has no monitor and no Stop rewake, so nothing would fetch an
+  // investigation's answer until the developer's next prompt. While one is
+  // pending, a tool hook asks for it, at most every 30 seconds; Codex gives
+  // PostToolUse context to the model.
+  const askInvestigation = agent === "codex" && hookEvent === "PostToolUse"
+    && readInvestigations(sessionExternalId).length > 0
+    && claimRefreshSlot(`${hash(sessionExternalId)}.investigation-poll.lock`, CODEX_INVESTIGATION_POLL_MS);
   // Hooks that cannot answer record their event locally and return at once.
-  const lane = hookLane(hookEvent, input, askProd ? prodCommand : null);
+  const lane = hookLane(hookEvent, input, askProd ? prodCommand : null, askInvestigation);
   if (lane !== "answer") {
     const output = await localHook(lane, { input, hookEvent, config, agent, cwd, sessionExternalId, visible });
     if (output) await emitDeliveryV2([output], hookEvent);
@@ -281,8 +288,13 @@ async function main() {
     ackPendingSurfaced(pending.filter((entry) => sent.has(entry.event)));
     ackPendingSurfaced(spooledItems.filter((item) => sent.has(item.event)).map((item) => item.entry));
 
+    // Keep asking for the ones still running; a finished one's answer is in
+    // this response's notes (or held with them), so stop asking for it.
     if (Array.isArray(response.investigations)) {
-      rememberInvestigations(sessionExternalId, response.investigations.map((inv) => inv?.id));
+      const listed = response.investigations.filter((inv) => isRecord(inv) && typeof inv.id === "string");
+      const running = listed.filter((inv) => inv.status === "queued" || inv.status === "running").map((inv) => inv.id);
+      rememberInvestigations(sessionExternalId, running);
+      forgetInvestigations(sessionExternalId, listed.map((inv) => inv.id).filter((id) => !running.includes(id)));
     }
   }
   if (peekSpool(sessionExternalId, 1).length) startSender({ sessionExternalId, cwd, agent, transcriptPath: input.transcript_path || null });
@@ -294,8 +306,9 @@ async function main() {
 
 // "answer": the hook's output depends on the server, so it waits for it.
 // Everything else is answered from local state, or not at all.
-function hookLane(hookEvent, input, prodCommand = null) {
+function hookLane(hookEvent, input, prodCommand = null, askInvestigation = false) {
   if (hookEvent === "SessionStart" || hookEvent === "UserPromptSubmit" || hookEvent === "Stop") return "answer";
+  if (hookEvent === "PostToolUse" && askInvestigation) return "answer";
   if (hookEvent === "PreToolUse") {
     const tool = String(input.tool_name || input.tool || "").toLowerCase();
     const command = String(input.tool_input?.command ?? input.toolInput?.command ?? "");
@@ -317,6 +330,7 @@ function hookLane(hookEvent, input, prodCommand = null) {
 // stacks use. Only the program a segment starts with counts: a word in a path
 // or a script being edited is not a production read.
 const PROD_COMMAND_INTERVAL_MS = 10 * 60 * 1000;
+const CODEX_INVESTIGATION_POLL_MS = 30 * 1000;
 function prodCommandSegments(command) {
   const out = [];
   let current = "";

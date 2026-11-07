@@ -179,6 +179,23 @@ whether any of it bears on the work.
   starts at the next whole line, and a line the agent is still writing waits
   for the next hook.
 
+## 2.0.9 Libra investigates on Codex too
+
+- Libra now judges every prompt you type for whether its production evidence
+  would help (an incident, failing jobs, what a deploy did, whether a fix held),
+  using one fast OpenAI Decisions call on the server with your two previous
+  prompts as context. On a Cedar engineer's 2,559 prompts it caught about 40%
+  of the moments their agent went on to read production, against 8% for the old
+  keyword match. Slash commands, notifications, reading Slack or email, writing tickets
+  and local test or build trouble still never start one. The hook does not get
+  slower: the call runs beside the existing prompt check.
+- Codex sessions now get these investigations. Codex has no monitor, so while
+  one is pending a tool hook (`PostToolUse`) asks for the answer at most every
+  30 seconds, and the answer reaches the agent as context on that tool call.
+  This needs the Codex hooks installed and approved in `/hooks`.
+- The hook now stops asking for an investigation as soon as the server reports
+  it finished, on any hook, not only from the monitor.
+
 ## Updating
 
 Third-party marketplaces do not auto-update by default. Turn it on once in
@@ -308,7 +325,12 @@ an answer directly.
 From 0.6.1 nobody has to call it: when the developer's own prompt is a production
 question, Libra starts the investigation from the prompt hook and the plugin polls
 for the answer the same way. A request that turns out not to be about production
-is dropped without a note.
+is dropped without a note. Since 2026-11-05 the server decides which prompts
+those are with a model judge instead of a keyword match (see 2.0.9 below).
+
+On Codex (from 2.0.9) there is no monitor, so while an investigation is pending
+a tool hook asks for it at most every 30 seconds and the answer reaches the agent
+as context on that tool call.
 
 ## Speed: only answering hooks wait
 
