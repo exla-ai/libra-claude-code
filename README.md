@@ -196,6 +196,19 @@ whether any of it bears on the work.
 - The hook now stops asking for an investigation as soon as the server reports
   it finished, on any hook, not only from the monitor.
 
+## 2.0.10 Investigation answers come back through a background agent
+
+- New `libra-investigator` agent. After `libra_investigate`, Claude starts it in
+  the background with the investigation id; it waits on
+  `libra_investigation` (which can now hold the call open for up to 40 seconds)
+  and hands Libra's answer back to Claude, which tells you in two or three lines.
+  You never wait on it, and it runs on the small model.
+- `/libra` and the `libra-ops` skill use it. Codex does the same with its own
+  `spawn_agent`, as the `libra_investigate` result tells it, so the answer
+  arrives even when Codex hooks were never approved.
+- The server side works without this release: any agent that can start a
+  background subagent follows the instructions in the tool result.
+
 ## Updating
 
 Third-party marketplaces do not auto-update by default. Turn it on once in
@@ -331,6 +344,18 @@ those are with a model judge instead of a keyword match (see 2.0.9 below).
 On Codex (from 2.0.9) there is no monitor, so while an investigation is pending
 a tool hook asks for it at most every 30 seconds and the answer reaches the agent
 as context on that tool call.
+
+From 2.0.10 the answer comes back to the agent without the developer waiting
+and without depending on hooks. `libra_investigate` tells the agent to say in one
+line that Libra is on it, then hand the wait to a background subagent: in Claude
+Code the plugin's `libra-investigator` agent (a small model that only calls
+`libra_investigation`), in Codex `spawn_agent`. That subagent calls
+`libra_investigation` with `waitSeconds: 40`, which holds the call open until the
+answer is ready, and returns the answer text to the main agent, which tells the
+developer in two or three lines. A Libra note for an answer the subagent already
+returned is not repeated. Codex sessions that never approved Libra's hooks still
+get the answer this way. The investigation playbook itself stays on Libra's
+server; nothing in the plugin carries it.
 
 ## Speed: only answering hooks wait
 

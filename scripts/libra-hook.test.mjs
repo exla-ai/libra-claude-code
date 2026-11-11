@@ -1293,7 +1293,7 @@ test("A tool call records locally and returns at once; a background sender posts
     assert.equal(sent.length, 6, "every tool event reached the server");
     assert.ok(requests.length <= 3, `a burst goes out in a few batches, not one per hook: ${requests.length}`);
     assert.ok(sent.every((e) => /^[0-9a-f]{40}$/.test(e.sourceHead || "") || e.sourceHead === null), "the sender stamps the head it sees");
-    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.9");
+    assert.equal(requests[0].body.metadata.pluginVersion, "2.0.10");
   });
 });
 
@@ -1410,7 +1410,7 @@ test("v2 sends capabilities and state, uses server prose once, and keeps Codex c
     assert.match(shown.hookSpecificOutput.additionalContext, /3 requests returned 500/);
     assert.doesNotMatch(shown.hookSpecificOutput.additionalContext, /\*\*Libra flagged/);
     assert.equal(requests[0].body.plugin.contract, 2);
-    assert.equal(requests[0].body.plugin.version, "2.0.9");
+    assert.equal(requests[0].body.plugin.version, "2.0.10");
     assert.equal(requests[0].body.plugin.state.phase, "working");
     assert.ok(requests[0].body.plugin.capabilities.hooks.includes("Stop"));
     assert.equal((await runHook({ api, home, cwd: repo, input: { ...input, session_id: "another-window" } })).stdout, "");
@@ -1856,7 +1856,7 @@ test("v2 old launch handoff reports original wiring and never prints from a lega
     const env = { LIBRA_API_URL: api, LIBRA_API_TOKEN: "libra_exla-api-key-test", LIBRA_HOOK_FLUSH: "inline" };
     const shown = await runInstalled({ ...install, env, input: { hook_event_name: "SessionStart", source: "startup", session_id: "old-v2-handoff", cwd: repo } });
     assert.match(shown.stdout, /Measured request failures/);
-    assert.equal(requests[0].body.plugin.version, "2.0.9");
+    assert.equal(requests[0].body.plugin.version, "2.0.10");
     assert.equal(requests[0].body.plugin.capabilities.launchVersion, "0.7.1");
     assert.deepEqual(requests[0].body.plugin.capabilities.hooks, ["SessionStart", "PostToolUse"]);
     const background = await runInstalled({ ...install, env, args: ["claude-code", "async"], input: { hook_event_name: "PostToolUse", session_id: "old-v2-handoff", cwd: repo, tool_name: "Bash", tool_input: { command: "gh pr checks 42" } } });

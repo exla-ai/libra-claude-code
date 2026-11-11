@@ -11,7 +11,7 @@ Libra is the user's production ops system for their AWS and GitHub. Answers must
 
 ## Workflow
 
-0. For a question that needs investigating (still happening, why, who is affected, did a deploy cause it), call `libra_investigate` and keep working. It runs on Libra's server and its answer arrives as a Libra note; call `libra_investigation` with the id once only if no note arrives. The steps below are for quick reads of what Libra already holds.
+0. For a question that needs investigating (still happening, why, who is affected, did a deploy cause it, is an alert right), call `libra_investigate`, tell the user in one line that Libra is on it, and keep working. It runs on Libra's server. Start the `libra-investigator` agent in the background with the investigation id; it waits for the answer and returns it to you, and you then tell the user in two or three lines with the answer's limits. If a Libra note with that id arrives first, use it instead and do not repeat it. The steps below are for quick reads of what Libra already holds.
 1. Prefer MCP tools when connected:
    - `libra_query`
    - `libra_list_risks` (stored risk register with proof state, observation times, deadlines, and caveats; not live health)
